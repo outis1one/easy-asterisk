@@ -9,22 +9,40 @@
 #   * Port forwarding tables with complete relay range
 #   * Visual flow diagrams showing cross-VLAN communication
 #   * Testing procedures for TURN/COTURN validation
+#
+# - FQDN/DOMAIN: Separate SIP and TURN domain support
+#   * Can use turn.example.com separate from sip.example.com
+#   * Caddy cert sync searches for certs covering both domains
+#   * Supports wildcard certs (*.example.com) or multi-SAN certs
+#   * Automatically displays snippets for both domains in Caddyfile
+#
+# - STATIC vs DYNAMIC IP: Intelligent IP type detection
+#   * Detects if user has static or dynamic public IP
+#   * Guides users on Dynamic DNS setup if needed
+#   * Lists popular DNS providers (Cloudflare, Namecheap, etc.)
+#   * Suggests VPN alternative (Tailscale) to avoid IP issues entirely
+#   * Prevents COTURN installation without proper DNS setup
+#
 # - COTURN: Enhanced configuration with listening-ip and relay-ip
 #   * Automatic local IP detection and binding
 #   * TLS support on port 5349
 #   * Optimized for OPNsense/VLAN environments
+#   * Checks IP type before installation
+#
 # - ASTERISK: Automatic ICE/STUN/TURN integration
 #   * pjsip.conf now includes ice_support on all transports
 #   * rtp.conf auto-configures with COTURN when enabled
-#   * Falls back to Google STUN when COTURN not configured
+#   * Google STUN fallback made OPTIONAL (asks user)
+#   * Can run with no STUN/TURN for VPN-only setups
+#
 # - BARESIP: Automatic TURN configuration
 #   * Auto-injects TURN credentials when COTURN enabled
 #   * No manual configuration required
+#
 # - AUTOMATION: Everything configures automatically - zero manual edits needed!
 #
 # RETAINED from v1.23:
 # - PTT Mute-default, Audio Ducking, Device Management
-# - Caddy Helper for both SIP and TURN domains
 # ================================================================
 
 set +e
@@ -88,6 +106,9 @@ load_config() {
     TURN_USER="${TURN_USER:-kioskuser}"
     TURN_PASS="${TURN_PASS:-}"
     TURN_DOMAIN="${TURN_DOMAIN:-}"
+    USE_GOOGLE_STUN="${USE_GOOGLE_STUN:-n}"
+    IP_TYPE="${IP_TYPE:-}"
+    HAS_DYNAMIC_DNS="${HAS_DYNAMIC_DNS:-}"
     return 0
 }
 
@@ -118,6 +139,9 @@ INSTALLED_SERVER="$INSTALLED_SERVER"
 INSTALLED_CLIENT="$INSTALLED_CLIENT"
 INSTALLED_COTURN="$INSTALLED_COTURN"
 USE_COTURN="$USE_COTURN"
+USE_GOOGLE_STUN="$USE_GOOGLE_STUN"
+IP_TYPE="$IP_TYPE"
+HAS_DYNAMIC_DNS="$HAS_DYNAMIC_DNS"
 TURN_SECRET="$TURN_SECRET"
 TURN_USER="$TURN_USER"
 TURN_PASS="$TURN_PASS"
@@ -125,6 +149,7 @@ CURRENT_PUBLIC_IP="$CURRENT_PUBLIC_IP"
 PTT_DEVICE="$PTT_DEVICE"
 PTT_KEYCODE="$PTT_KEYCODE"
 LOCAL_CIDR="$LOCAL_CIDR"
+CLIENT_ANSWERMODE="$CLIENT_ANSWERMODE"
 EOF
     chmod 600 "$CONFIG_FILE"
     
@@ -166,8 +191,92 @@ get_public_ip() {
     echo "$ip"
 }
 
+check_ip_type_and_dns() {
+    print_header "IP Address Configuration"
+
+    local current_ip=$(get_public_ip)
+    [[ -n "$current_ip" ]] && echo "Your current public IP: ${BOLD}$current_ip${NC}"
+    echo ""
+
+    echo "Do you have a STATIC or DYNAMIC public IP address?"
+    echo "  ${BOLD}Static${NC}:  IP never changes (common with business internet)"
+    echo "  ${BOLD}Dynamic${NC}: IP changes periodically (common with residential internet)"
+    echo ""
+    echo "Not sure? Check with your ISP or wait 24-48 hours and run 'curl ifconfig.me'"
+    echo "to see if your IP changed."
+    echo ""
+    read -p "Is your IP [S]tatic or [D]ynamic? [s/D]: " ip_choice
+
+    if [[ "$ip_choice" =~ ^[Ss]$ ]]; then
+        IP_TYPE="static"
+        print_success "Static IP configured - COTURN will work reliably!"
+        return 0
+    else
+        IP_TYPE="dynamic"
+        print_warn "Dynamic IP detected"
+        echo ""
+        echo "With a dynamic IP, your TURN server will break when your IP changes."
+        echo ""
+        echo "Do you have a method to automatically update your domain's DNS record"
+        echo "when your IP changes? (Examples: ddclient, router built-in DDNS,"
+        echo "Cloudflare API script, etc.)"
+        echo ""
+        read -p "Do you have automatic DNS updates configured? [y/N]: " dns_choice
+
+        if [[ "$dns_choice" =~ ^[Yy]$ ]]; then
+            HAS_DYNAMIC_DNS="y"
+            print_success "Great! Your COTURN should work with DDNS."
+        else
+            HAS_DYNAMIC_DNS="n"
+            echo ""
+            print_warn "${BOLD}STOPPING POINT:${NC} You need to configure Dynamic DNS first!"
+            echo ""
+            echo "╔════════════════════════════════════════════════════════════╗"
+            echo "║  OPTION 1: Configure Dynamic DNS with your provider       ║"
+            echo "╚════════════════════════════════════════════════════════════╝"
+            echo ""
+            echo "Popular DNS providers and their DDNS solutions:"
+            echo "  • Cloudflare: Use 'cloudflare-ddns' or API scripts"
+            echo "  • Google Domains: Built-in Dynamic DNS"
+            echo "  • Namecheap: Built-in Dynamic DNS"
+            echo "  • No-IP / DynDNS: Dedicated DDNS services"
+            echo "  • Your Router: Many routers have built-in DDNS clients"
+            echo ""
+            echo "Search for: 'YOUR_PROVIDER dynamic dns setup'"
+            echo ""
+            echo "╔════════════════════════════════════════════════════════════╗"
+            echo "║  OPTION 2: Use a VPN Instead (Recommended!)               ║"
+            echo "╚════════════════════════════════════════════════════════════╝"
+            echo ""
+            echo "A VPN (like Tailscale or WireGuard) avoids ALL these issues:"
+            echo "  ✓ No port forwarding needed"
+            echo "  ✓ No COTURN needed"
+            echo "  ✓ No dynamic IP problems"
+            echo "  ✓ Works across VLANs automatically"
+            echo "  ✓ More secure than exposing services to internet"
+            echo ""
+            echo "To use VPN mode with this script:"
+            echo "  1. Install Tailscale (curl -fsSL https://tailscale.com/install.sh | sh)"
+            echo "  2. Run: tailscale up"
+            echo "  3. Use your Tailscale IP (100.x.x.x) as ASTERISK_HOST"
+            echo "  4. Skip COTURN installation entirely"
+            echo ""
+            read -p "Press Enter to continue or Ctrl+C to exit and set up DDNS/VPN..."
+        fi
+    fi
+
+    save_config
+    return 0
+}
+
 install_coturn() {
     print_header "Installing COTURN"
+
+    # Check IP type and DNS configuration first
+    if [[ "$IP_TYPE" != "static" && "$HAS_DYNAMIC_DNS" != "y" ]]; then
+        check_ip_type_and_dns
+    fi
+
     apt update
     apt install -y coturn
 
@@ -1526,9 +1635,12 @@ turnaddr=${turn_host}:${DEFAULT_TURN_PORT}
 turnusername=${TURN_USER}
 turnpassword=${TURN_PASS}"
         print_info "RTP.conf: Configured with COTURN server"
-    else
+    elif [[ "$USE_GOOGLE_STUN" == "y" ]]; then
         turn_config="stunaddr=stun.l.google.com:19302"
-        print_info "RTP.conf: Using Google STUN (COTURN not configured)"
+        print_info "RTP.conf: Using Google STUN fallback"
+    else
+        turn_config="# STUN/TURN not configured - using direct connections"
+        print_info "RTP.conf: No STUN/TURN (direct connections only)"
     fi
 
     cat > /etc/asterisk/rtp.conf << EOF
@@ -1934,18 +2046,22 @@ check_cert_coverage() {
 setup_caddy_cert_sync() {
     local mode=$1
     [[ "$mode" == "force" ]] && print_header "Caddy Cert Sync"
-    
+
     load_config
     local domain=${DOMAIN_NAME:-sip.example.com}
+    local turn_domain=${TURN_DOMAIN:-$domain}
+
     if [[ "$mode" == "force" ]]; then
-        read -p "Domain [$domain]: " input_domain
+        read -p "SIP Domain [$domain]: " input_domain
         domain="${input_domain:-$domain}"
+        read -p "TURN Domain [$turn_domain]: " input_turn
+        turn_domain="${input_turn:-$turn_domain}"
     fi
 
     local actual_user="${SUDO_USER:-$USER}"
     local actual_home=$(eval echo ~"$actual_user")
     local base_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
-    
+
     local search_paths=(
         "${actual_home}/docker/caddy/ssl"
         "${actual_home}/docker/caddy/caddy_data"
@@ -1957,18 +2073,38 @@ setup_caddy_cert_sync() {
     )
     local caddy_cert="" caddy_key=""
 
-    [[ "$mode" == "force" ]] && echo "Searching for certificates..."
-    
+    [[ "$mode" == "force" ]] && echo "Searching for certificates covering: $domain and $turn_domain..."
+
+    # Search for a cert that covers both domains (or just SIP if they're the same)
     for base_path in "${search_paths[@]}"; do
         if ! sudo test -d "$base_path" 2>/dev/null; then continue; fi
         [[ "$mode" == "force" ]] && echo "  Checking: $base_path"
-        
+
         local candidates=$(sudo find "$base_path" -maxdepth 5 -type f \( -name "fullchain.pem" -o -name "*.crt" \) 2>/dev/null)
-        
+
         for cert in $candidates; do
             sudo cp "$cert" /tmp/cert_check.pem 2>/dev/null || continue
+
+            # Check if cert covers SIP domain
+            local sip_ok=false
+            local turn_ok=false
+
             if check_cert_coverage "/tmp/cert_check.pem" "$domain" "$base_domain"; then
-                [[ "$mode" == "force" ]] && print_success "Found matching cert: $cert"
+                sip_ok=true
+            fi
+
+            # If TURN domain is different, check if cert covers it too
+            if [[ "$turn_domain" != "$domain" ]]; then
+                if check_cert_coverage "/tmp/cert_check.pem" "$turn_domain" "$base_domain"; then
+                    turn_ok=true
+                fi
+            else
+                turn_ok=true  # Same domain, so already covered
+            fi
+
+            # If cert covers both (or just SIP if same), we found it!
+            if [[ "$sip_ok" == "true" && "$turn_ok" == "true" ]]; then
+                [[ "$mode" == "force" ]] && print_success "Found cert covering both domains: $cert"
                 caddy_cert="$cert"
                 local dir=$(dirname "$cert")
                 local name=$(basename "$cert")
@@ -1985,28 +2121,38 @@ setup_caddy_cert_sync() {
             rm -f /tmp/cert_check.pem
         done
     done
-    
+
     if [[ -n "$caddy_cert" && -n "$caddy_key" ]]; then
         mkdir -p /etc/asterisk/certs
         sudo cat "$caddy_cert" > /etc/asterisk/certs/server.crt
         sudo cat "$caddy_key" > /etc/asterisk/certs/server.key
-        
+
         chown asterisk:asterisk /etc/asterisk/certs/server.*
         chmod 644 /etc/asterisk/certs/server.crt
         chmod 600 /etc/asterisk/certs/server.key
-        
+
         DOMAIN_NAME="$domain"
+        TURN_DOMAIN="$turn_domain"
         ENABLE_TLS="y"
         ASTERISK_HOST="$domain"
         save_config
-        
+
         generate_pjsip_conf
         restart_asterisk_safe
-        
-        [[ "$mode" == "force" ]] && print_success "Certificates installed for $domain"
+
+        if [[ "$turn_domain" != "$domain" ]]; then
+            [[ "$mode" == "force" ]] && print_success "Certificates installed for $domain and $turn_domain"
+        else
+            [[ "$mode" == "force" ]] && print_success "Certificates installed for $domain"
+        fi
         return 0
     else
-        [[ "$mode" == "force" ]] && print_warn "No matching certificates found"
+        if [[ "$turn_domain" != "$domain" ]]; then
+            [[ "$mode" == "force" ]] && print_warn "No certificate found covering both $domain and $turn_domain"
+            [[ "$mode" == "force" ]] && echo "Hint: Use a wildcard cert (*.$(echo $domain | awk -F. '{print $(NF-1)"."$NF}')) or a cert with both domains in SAN"
+        else
+            [[ "$mode" == "force" ]] && print_warn "No matching certificates found for $domain"
+        fi
         return 1
     fi
 }
@@ -2121,7 +2267,30 @@ setup_internet_access() {
             fi
             ;;
     esac
-    
+
+    # Ask about Google STUN fallback
+    if [[ "$USE_COTURN" != "y" ]]; then
+        echo ""
+        echo "─────────────────────────────────────────────────────────────"
+        echo "STUN/TURN Configuration"
+        echo ""
+        echo "Without a TURN server (COTURN), clients may have trouble with"
+        echo "NAT traversal and cross-VLAN calls."
+        echo ""
+        echo "Would you like to enable Google's public STUN server as a fallback?"
+        echo "  ${GREEN}Pro:${NC} Free, helps with basic NAT traversal"
+        echo "  ${RED}Con:${NC} Won't work for strict firewalls or VLAN isolation"
+        echo ""
+        read -p "Enable Google STUN fallback? [y/N]: " use_google
+        if [[ "$use_google" =~ ^[Yy]$ ]]; then
+            USE_GOOGLE_STUN="y"
+            print_info "Google STUN enabled"
+        else
+            USE_GOOGLE_STUN="n"
+            print_info "Direct connections only (consider installing COTURN for NAT/VLAN support)"
+        fi
+    fi
+
     ENABLE_TLS="y"
     save_config
     generate_pjsip_conf
