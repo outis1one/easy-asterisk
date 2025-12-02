@@ -1,11 +1,30 @@
 #!/bin/bash
 # ================================================================
-# Easy Asterisk - Interactive Installer v1.23
-# 
-# UPDATES in v1.23:
-# - CLARIFIED: Router Guide now explicitly separates VLAN (Allow) vs WAN (NAT)
-# - ADDED: Caddy Helper now generates snippets for both SIP and TURN domains
-# - RETAINED: PTT Mute-default, Audio Ducking, Device Management
+# Easy Asterisk - Interactive Installer v1.24
+#
+# UPDATES in v1.24:
+# - COMPREHENSIVE: Complete OPNsense/pfSense VLAN configuration guide
+#   * Full network topology documentation (LAN + VLAN 20/30/40)
+#   * Step-by-step firewall rules for VLAN isolation
+#   * Port forwarding tables with complete relay range
+#   * Visual flow diagrams showing cross-VLAN communication
+#   * Testing procedures for TURN/COTURN validation
+# - COTURN: Enhanced configuration with listening-ip and relay-ip
+#   * Automatic local IP detection and binding
+#   * TLS support on port 5349
+#   * Optimized for OPNsense/VLAN environments
+# - ASTERISK: Automatic ICE/STUN/TURN integration
+#   * pjsip.conf now includes ice_support on all transports
+#   * rtp.conf auto-configures with COTURN when enabled
+#   * Falls back to Google STUN when COTURN not configured
+# - BARESIP: Automatic TURN configuration
+#   * Auto-injects TURN credentials when COTURN enabled
+#   * No manual configuration required
+# - AUTOMATION: Everything configures automatically - zero manual edits needed!
+#
+# RETAINED from v1.23:
+# - PTT Mute-default, Audio Ducking, Device Management
+# - Caddy Helper for both SIP and TURN domains
 # ================================================================
 
 set +e
@@ -151,59 +170,90 @@ install_coturn() {
     print_header "Installing COTURN"
     apt update
     apt install -y coturn
-    
+
     if [[ -z "$TURN_PASS" ]]; then
         TURN_PASS=$(generate_password)
     fi
-    
+
     local public_ip=$(get_public_ip)
     CURRENT_PUBLIC_IP="$public_ip"
-    
+
     if [[ -z "$public_ip" ]]; then
         print_error "Could not detect public IP"
         return 1
     fi
-    
+
+    # Get local IP
+    local local_ip=$(hostname -I | cut -d' ' -f1)
+    [[ -z "$local_ip" ]] && local_ip="0.0.0.0"
+
     print_info "Public IP: $public_ip"
-    
+    print_info "Local IP: $local_ip"
+
     # Enable coturn
     sed -i 's/#TURNSERVER_ENABLED=1/TURNSERVER_ENABLED=1/' /etc/default/coturn 2>/dev/null || true
-    
+
     # Configure coturn
     backup_config "$COTURN_CONFIG"
     cat > "$COTURN_CONFIG" << EOF
-# Easy Asterisk COTURN Configuration
+# Easy Asterisk COTURN Configuration (OPNsense/VLAN Ready)
+# Generated: $(date)
+
+# Listening Configuration (Internal IP)
+listening-ip=${local_ip}
+relay-ip=${local_ip}
 listening-port=${DEFAULT_TURN_PORT}
+tls-listening-port=5349
+
+# External IP (for NAT traversal)
+external-ip=${public_ip}
+
+# Realm and Authentication
+realm=${TURN_DOMAIN:-${DOMAIN_NAME:-turn.local}}
 fingerprint
 lt-cred-mech
-realm=${TURN_DOMAIN:-${DOMAIN_NAME:-turn.local}}
+
+# Relay Port Range (CRITICAL for VLAN/NAT)
+min-port=49152
+max-port=65535
+
+# User Credentials
+user=${TURN_USER}:${TURN_PASS}
+
+# Security Settings
 total-quota=100
+user-quota=12
 stale-nonce=600
+no-multicast-peers
+no-loopback-peers
+
+# TLS Configuration (if certs available)
 cert=/etc/asterisk/certs/server.crt
 pkey=/etc/asterisk/certs/server.key
 no-tlsv1
 no-tlsv1_1
 cipher-list="ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384"
 dh2066
+
+# Logging
 no-stdout-log
 log-file=/var/log/turnserver.log
 simple-log
-external-ip=${public_ip}
-min-port=49152
-max-port=65535
-user-quota=12
-no-multicast-peers
+
+# Optimization
 no-cli
-user=${TURN_USER}:${TURN_PASS}
 EOF
 
     chmod 600 "$COTURN_CONFIG"
-    
+
     systemctl enable coturn
     systemctl restart coturn
-    
+
     if systemctl is-active coturn >/dev/null; then
         print_success "COTURN installed and running"
+        print_info "Listening on: $local_ip:${DEFAULT_TURN_PORT}"
+        print_info "External IP: $public_ip"
+        print_info "Relay Range: 49152-65535"
         INSTALLED_COTURN="y"
         USE_COTURN="y"
         save_config
@@ -996,45 +1046,132 @@ show_port_requirements() {
 }
 
 show_firewall_guide() {
-    print_header "Interactive Firewall Guide (Hand-holding Mode)"
-    echo "For: OPNsense, pfSense, or Advanced Routers"
+    print_header "OPNsense/pfSense Configuration Guide"
+
+    local server_ip="${ASTERISK_HOST:-192.168.1.50}"
+    local server_fqdn="${DOMAIN_NAME:-your.fqdn.com}"
+
+    echo "╔═══════════════════════════════════════════════════════════════╗"
+    echo "║           YOUR NETWORK LAYOUT (Example)                       ║"
+    echo "╚═══════════════════════════════════════════════════════════════╝"
     echo ""
-    echo "=== SCENARIO A: INTERNAL ONLY (VLAN to VLAN) ==="
-    echo "Example: Kiosks on VLAN 10, Server on VLAN 20"
-    echo "GOAL: Allow Kiosks to talk to Server."
+    echo "    Internet"
+    echo "        ↓"
+    echo "    OPNsense Router ($server_fqdn)"
+    echo "        ↓"
+    echo "    ├─ LAN    (192.168.1.0/24) ← Asterisk + COTURN ($server_ip)"
+    echo "    ├─ VLAN 20 (192.168.2.0/24) ← Devices that need intercom"
+    echo "    ├─ VLAN 30 (192.168.3.0/24) ← Devices that need intercom"
+    echo "    └─ VLAN 40 (192.168.4.0/24) ← Devices that need intercom"
     echo ""
-    echo "STEP 1: Log in to Router. Go to Firewall > Rules > VLAN 10 Interface."
-    echo "        (Do NOT use 'Port Forwarding' for internal VLANs!)"
+    echo "═══════════════════════════════════════════════════════════════════"
     echo ""
-    echo "STEP 2: Create Rule 1 (Signaling)"
-    echo "   - Action: Pass (Allow)"
-    echo "   - Protocol: UDP/TCP"
-    echo "   - Source: VLAN 10 Net"
-    echo "   - Dest:   ${CURRENT_PUBLIC_IP:-Server_IP}"
-    echo "   - Port:   3478"
+    echo "${BOLD}STEP 1: PORT FORWARDING (WAN → COTURN/Asterisk)${NC}"
+    echo "Location: Firewall → NAT → Port Forward"
     echo ""
-    echo "STEP 3: Create Rule 2 (The Relay Range - CRITICAL)"
-    echo "   - Action: Pass (Allow)"
-    echo "   - Protocol: UDP"
-    echo "   - Source: VLAN 10 Net"
-    echo "   - Dest:   ${CURRENT_PUBLIC_IP:-Server_IP}"
-    echo "   - Port Range:"
-    echo "       From: 49152"
-    echo "       To:   65535"
-    echo "     (Note: Type these numbers in the Start/End boxes)"
+    echo "┌───────────┬──────────┬─────────┬──────────────┬──────────────┬────────────────────────┐"
+    echo "│ Interface │ Protocol │ Src     │ Dst Port     │ Redirect IP  │ Redirect Port │ Description           │"
+    echo "├───────────┼──────────┼─────────┼──────────────┼──────────────┼───────────────┼────────────────────────┤"
+    echo "│ WAN       │ UDP      │ *       │ 3478         │ $server_ip   │ 3478          │ COTURN STUN/TURN      │"
+    echo "│ WAN       │ UDP/TCP  │ *       │ 5349         │ $server_ip   │ 5349          │ COTURN TLS            │"
+    echo "│ WAN       │ UDP      │ *       │ 49152-65535  │ $server_ip   │ 49152-65535   │ COTURN relay          │"
+    echo "│ WAN       │ UDP      │ *       │ 5060         │ $server_ip   │ 5060          │ Asterisk SIP          │"
+    echo "│ WAN       │ TCP      │ *       │ 5061         │ $server_ip   │ 5061          │ Asterisk SIP-TLS      │"
+    echo "└───────────┴──────────┴─────────┴──────────────┴──────────────┴───────────────┴────────────────────────┘"
     echo ""
-    echo "================================================"
+    echo "═══════════════════════════════════════════════════════════════════"
     echo ""
-    echo "=== SCENARIO B: EXTERNAL ACCESS (Internet to LAN) ==="
-    echo "Example: Remote phone connecting from a hotel."
-    echo "GOAL: Forward traffic from Internet to Server."
+    echo "${BOLD}STEP 2: FIREWALL RULES FOR VLAN ISOLATION${NC}"
     echo ""
-    echo "STEP 1: Go to Firewall > NAT > Port Forwarding."
-    echo "STEP 2: Create Rule."
-    echo "   - Interface: WAN"
-    echo "   - Protocol: UDP"
-    echo "   - Dest. Port: 3478 (and 49152-65535)"
-    echo "   - Redirect IP: ${CURRENT_PUBLIC_IP:-Server_IP}"
+    echo "${CYAN}━━━ LAN Rules (192.168.1.0/24 - Where Asterisk/COTURN Live) ━━━${NC}"
+    echo "Location: Firewall → Rules → LAN"
+    echo ""
+    echo "┌───┬────────┬──────────┬─────────────────┬─────────────────┬──────────────┬──────────────────────────┐"
+    echo "│ # │ Action │ Protocol │ Source          │ Destination     │ Dst Port     │ Description              │"
+    echo "├───┼────────┼──────────┼─────────────────┼─────────────────┼──────────────┼──────────────────────────┤"
+    echo "│ 1 │ Pass   │ IPv4 *   │ $server_ip      │ any             │ *            │ Asterisk/COTURN outbound │"
+    echo "│ 2 │ Pass   │ UDP      │ LAN net         │ $server_ip      │ 3478         │ Local STUN/TURN          │"
+    echo "│ 3 │ Pass   │ UDP      │ LAN net         │ $server_ip      │ 5060         │ Local SIP                │"
+    echo "│ 4 │ Pass   │ TCP      │ LAN net         │ $server_ip      │ 5061         │ Local SIP-TLS            │"
+    echo "│ 5 │ Pass   │ IPv4 *   │ LAN net         │ any             │ *            │ Allow other LAN traffic  │"
+    echo "│ 6 │ Block  │ IPv4 *   │ LAN net         │ 192.168.2.0/24  │ *            │ Block to VLAN 20         │"
+    echo "│ 7 │ Block  │ IPv4 *   │ LAN net         │ 192.168.3.0/24  │ *            │ Block to VLAN 30         │"
+    echo "│ 8 │ Block  │ IPv4 *   │ LAN net         │ 192.168.4.0/24  │ *            │ Block to VLAN 40         │"
+    echo "└───┴────────┴──────────┴─────────────────┴─────────────────┴──────────────┴──────────────────────────┘"
+    echo ""
+    echo "${YELLOW}Note: Rules 6-8 block LAN from initiating connections to VLANs (optional)${NC}"
+    echo ""
+    echo "${CYAN}━━━ VLAN 20 Rules (192.168.2.0/24) ━━━${NC}"
+    echo "Location: Firewall → Rules → VLAN_20"
+    echo ""
+    echo "┌───┬────────┬──────────┬──────────────┬──────────────┬──────────────┬─────────────────────────────┐"
+    echo "│ # │ Action │ Protocol │ Source       │ Destination  │ Dst Port     │ Description                 │"
+    echo "├───┼────────┼──────────┼──────────────┼──────────────┼──────────────┼─────────────────────────────┤"
+    echo "│ 1 │ Pass   │ UDP      │ VLAN_20 net  │ $server_ip   │ 5060         │ SIP to Asterisk             │"
+    echo "│ 2 │ Pass   │ TCP      │ VLAN_20 net  │ $server_ip   │ 5061         │ SIP-TLS to Asterisk         │"
+    echo "│ 3 │ Pass   │ UDP      │ VLAN_20 net  │ $server_ip   │ 3478         │ STUN/TURN                   │"
+    echo "│ 4 │ Pass   │ UDP      │ VLAN_20 net  │ $server_ip   │ 5349         │ TURN-TLS                    │"
+    echo "│ 5 │ Pass   │ UDP      │ VLAN_20 net  │ $server_ip   │ 49152-65535  │ TURN relay ports            │"
+    echo "│ 6 │ Pass   │ IPv4 *   │ VLAN_20 net  │ !RFC1918     │ *            │ Internet access only        │"
+    echo "│ 7 │ Block  │ IPv4 *   │ VLAN_20 net  │ 192.168.1.0/24│ *           │ Block to LAN (except above) │"
+    echo "│ 8 │ Block  │ IPv4 *   │ VLAN_20 net  │ 192.168.3.0/24│ *           │ Block to VLAN 30            │"
+    echo "│ 9 │ Block  │ IPv4 *   │ VLAN_20 net  │ 192.168.4.0/24│ *           │ Block to VLAN 40            │"
+    echo "└───┴────────┴──────────┴──────────────┴──────────────┴──────────────┴─────────────────────────────┘"
+    echo ""
+    echo "${BOLD}IMPORTANT:${NC} Rules are processed top-down. Rules 1-5 match first (allow to"
+    echo "COTURN/Asterisk), then rules 7-9 block everything else."
+    echo ""
+    echo "${CYAN}━━━ VLAN 30 Rules (192.168.3.0/24) ━━━${NC}"
+    echo "Same as VLAN 20, but:"
+    echo "  - Rule 7: Block to 192.168.1.0/24 (LAN)"
+    echo "  - Rule 8: Block to 192.168.2.0/24 (VLAN 20)"
+    echo "  - Rule 9: Block to 192.168.4.0/24 (VLAN 40)"
+    echo ""
+    echo "${CYAN}━━━ VLAN 40 Rules (192.168.4.0/24) ━━━${NC}"
+    echo "Same as VLAN 20, but:"
+    echo "  - Rule 7: Block to 192.168.1.0/24 (LAN)"
+    echo "  - Rule 8: Block to 192.168.2.0/24 (VLAN 20)"
+    echo "  - Rule 9: Block to 192.168.3.0/24 (VLAN 30)"
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo ""
+    echo "${BOLD}VISUAL FLOW (How VLANs Communicate)${NC}"
+    echo ""
+    echo "Device 192.168.2.10 (VLAN 20)"
+    echo "    ↓ Firewall allows: .2.10 → .1.50:3478"
+    echo "COTURN 192.168.1.50"
+    echo "    ↓ Firewall allows: .1.50 → .3.20"
+    echo "Device 192.168.3.20 (VLAN 30)"
+    echo ""
+    echo "${GREEN}✓ VLANs communicate through COTURN:${NC}"
+    echo "  192.168.2.10 → 192.168.1.50 → 192.168.3.20 ${GREEN}ALLOWED${NC}"
+    echo ""
+    echo "${RED}✗ VLANs cannot talk directly:${NC}"
+    echo "  192.168.2.10 → 192.168.3.20 ${RED}BLOCKED${NC}"
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo ""
+    echo "${BOLD}TESTING YOUR CONFIGURATION${NC}"
+    echo ""
+    echo "Test 1: VLAN 20 can reach COTURN"
+    echo "  From device on 192.168.2.x:"
+    echo "  ${CYAN}nc -vuz $server_ip 3478${NC}"
+    echo "  Should succeed"
+    echo ""
+    echo "Test 2: VLAN 20 CANNOT reach VLAN 30"
+    echo "  From device on 192.168.2.x:"
+    echo "  ${CYAN}ping 192.168.3.1${NC}"
+    echo "  Should FAIL (timeout)"
+    echo ""
+    echo "Test 3: Verify traffic flows through COTURN"
+    echo "  On Asterisk server:"
+    echo "  ${CYAN}tcpdump -i any host $server_ip and port 3478 -n${NC}"
+    echo "  You should see packets from 192.168.2.x, 192.168.3.x, 192.168.4.x"
+    echo ""
+    echo "Test 4: Cross-VLAN call"
+    echo "  Device on 192.168.2.x calls device on 192.168.3.x"
+    echo "  Check COTURN logs:"
+    echo "  ${CYAN}journalctl -u coturn -f${NC}"
     echo ""
     read -p "Press Enter to return..."
 }
@@ -1379,13 +1516,30 @@ transport=config,pjsip.conf,criteria=type=transport
 EOF
     fi
     
+    # Configure RTP with TURN/STUN
+    local turn_host="${DOMAIN_NAME:-${ASTERISK_HOST:-$(hostname -I | cut -d' ' -f1)}}"
+    local turn_config=""
+
+    if [[ "$USE_COTURN" == "y" && -n "$TURN_USER" && -n "$TURN_PASS" ]]; then
+        turn_config="stunaddr=${turn_host}:${DEFAULT_TURN_PORT}
+turnaddr=${turn_host}:${DEFAULT_TURN_PORT}
+turnusername=${TURN_USER}
+turnpassword=${TURN_PASS}"
+        print_info "RTP.conf: Configured with COTURN server"
+    else
+        turn_config="stunaddr=stun.l.google.com:19302"
+        print_info "RTP.conf: Using Google STUN (COTURN not configured)"
+    fi
+
     cat > /etc/asterisk/rtp.conf << EOF
+; Easy Asterisk RTP Configuration
+; Generated: $(date)
 [general]
 rtpstart=10000
 rtpend=20000
 strictrtp=yes
 icesupport=yes
-stunaddr=stun.l.google.com:19302
+${turn_config}
 EOF
     
     cat > /etc/asterisk/logger.conf << EOF
@@ -1427,7 +1581,8 @@ local_net=$local_net"
     fi
 
     cat > "$conf_file" << EOF
-; Easy Asterisk v1.23
+; Easy Asterisk v1.23 (OPNsense/VLAN Ready)
+; Generated: $(date)
 [global]
 type=global
 user_agent=EasyAsterisk
@@ -1436,18 +1591,21 @@ user_agent=EasyAsterisk
 type=transport
 protocol=udp
 bind=0.0.0.0:${DEFAULT_SIP_PORT}
+ice_support=yes
 ${nat_settings}
 
 [transport-tcp]
 type=transport
 protocol=tcp
 bind=0.0.0.0:${DEFAULT_SIP_PORT}
+ice_support=yes
 ${nat_settings}
 
 [transport-tls]
 type=transport
 protocol=tls
 bind=0.0.0.0:${DEFAULT_SIPS_PORT}
+ice_support=yes
 cert_file=/etc/asterisk/certs/server.crt
 priv_key_file=/etc/asterisk/certs/server.key
 ca_list_file=/etc/ssl/certs/ca-certificates.crt
@@ -1618,7 +1776,7 @@ restart_asterisk_safe() {
 configure_baresip() {
     local baresip_dir="/home/${KIOSK_USER}/.baresip"
     mkdir -p "$baresip_dir"
-    
+
     # Detect network interface
     local found_iface=""
     for target in 8.8.8.8 1.1.1.1 9.9.9.9; do
@@ -1652,22 +1810,29 @@ module turn.so
 EOF
 
     [[ -n "$found_iface" ]] && echo "net_interface $found_iface" >> "${baresip_dir}/config"
-    
+
+    # Configure TURN if COTURN is enabled
+    if [[ "$USE_COTURN" == "y" && -n "$TURN_USER" && -n "$TURN_PASS" ]]; then
+        local turn_host="${DOMAIN_NAME:-${ASTERISK_HOST}}"
+        echo "turn_server turn:${TURN_USER}:${TURN_PASS}@${turn_host}:${DEFAULT_TURN_PORT}" >> "${baresip_dir}/config"
+        print_success "Baresip: TURN server configured (${turn_host}:${DEFAULT_TURN_PORT})"
+    fi
+
     local transport="udp"
     local mediaenc=""
-    if [[ "$ENABLE_TLS" == "y" ]]; then 
+    if [[ "$ENABLE_TLS" == "y" ]]; then
         transport="tls"
         mediaenc=";mediaenc=srtp"
     fi
-    
+
     local amode="${CLIENT_ANSWERMODE:-auto}"
-    
+
     cat > "${baresip_dir}/accounts" << EOF
 <sip:${KIOSK_EXTENSION}@${ASTERISK_HOST};transport=${transport}>;auth_pass=${SIP_PASSWORD};answermode=${amode}${mediaenc}
 EOF
     chown -R ${KIOSK_USER}:${KIOSK_USER} "$baresip_dir"
     chmod 700 "$baresip_dir"
-    
+
     configure_audio_ducking
     create_ptt_handler
     create_baresip_launcher
