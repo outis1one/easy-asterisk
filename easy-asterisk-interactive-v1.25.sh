@@ -74,9 +74,9 @@
 set +e
 
 # Version and Update Info
-SCRIPT_VERSION="1.25"
+SCRIPT_VERSION="1.26"
 GITHUB_REPO="outis1one/asterisk-easy"
-SCRIPT_NAME="easy-asterisk-interactive-v1.25.sh"
+SCRIPT_NAME="easy-asterisk-interactive-v1.26.sh"
 BACKUP_DIR="/etc/easy-asterisk/backups"
 
 # Colors
@@ -1945,7 +1945,7 @@ local_net=$local_net"
     fi
 
     cat > "$conf_file" << EOF
-; Easy Asterisk v1.23 (OPNsense/VLAN Ready)
+; Easy Asterisk v1.26 (OPNsense/VLAN Ready)
 ; Generated: $(date)
 [global]
 type=global
@@ -3170,7 +3170,7 @@ uninstall_menu() {
 
 show_main_menu() {
     clear
-    print_header "Easy Asterisk v1.25"
+    print_header "Easy Asterisk v1.26"
     
     load_config
     echo "  Status:"
