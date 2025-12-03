@@ -74,9 +74,9 @@
 set +e
 
 # Version and Update Info
-SCRIPT_VERSION="1.25"
+SCRIPT_VERSION="1.26"
 GITHUB_REPO="outis1one/asterisk-easy"
-SCRIPT_NAME="easy-asterisk-interactive-v1.25.sh"
+SCRIPT_NAME="easy-asterisk-interactive-v1.26.sh"
 BACKUP_DIR="/etc/easy-asterisk/backups"
 
 # Colors
@@ -969,11 +969,13 @@ max_contacts=5
 remove_existing=yes
 qualify_frequency=60
 EOF
-    
+
     chown -R asterisk:asterisk /etc/asterisk
+    echo ""
+    print_info "Reloading Asterisk configuration (this may take a moment)..."
     asterisk -rx "pjsip reload" >/dev/null 2>&1
     rebuild_dialplan
-    
+
     echo "════════════════════════════════════════════════════════"
     echo "  DEVICE ADDED"
     echo "════════════════════════════════════════════════════════"
@@ -1943,7 +1945,7 @@ local_net=$local_net"
     fi
 
     cat > "$conf_file" << EOF
-; Easy Asterisk v1.23 (OPNsense/VLAN Ready)
+; Easy Asterisk v1.26 (OPNsense/VLAN Ready)
 ; Generated: $(date)
 [global]
 type=global
@@ -2864,14 +2866,84 @@ install_full() {
     KIOSK_USER="${target_user:-$default_user}"
     KIOSK_UID=$(id -u "$KIOSK_USER")
 
-    # Check for VPN
+    # Check for VPN first
+    echo ""
+    print_header "VPN Detection"
+    echo "VPNs (Tailscale, NetBird, WireGuard) are great for:"
+    echo "  • Connecting kiosks on different VLANs without COTURN"
+    echo "  • Allowing internet users to call internal kiosks"
+    echo "  • Avoiding complex firewall/NAT configuration"
+    echo ""
     detect_vpn_interface || true
 
+    # Basic config
     if ! collect_common_config; then return; fi
     collect_client_config
+
+    # Install base software
     install_dependencies
     INSTALLED_SERVER="y"
     INSTALLED_CLIENT="y"
+
+    # Optional: Internet/FQDN setup
+    echo ""
+    print_header "Internet Access (Optional)"
+    echo "Do you want to setup internet calling with FQDN and TLS certificates?"
+    echo ""
+    echo -e "  ${GREEN}Choose YES if:${NC}"
+    echo "    • You want internet users to call your system"
+    echo "    • You have a domain name (FQDN)"
+    echo "    • You need TLS encryption"
+    echo ""
+    echo -e "  ${YELLOW}Choose NO if:${NC}"
+    echo "    • Local network only"
+    echo "    • Using VPN for remote access"
+    echo ""
+    read -p "Setup internet access with FQDN/certs? [y/N]: " do_internet
+
+    if [[ "$do_internet" =~ ^[Yy]$ ]]; then
+        setup_internet_access
+    else
+        # Local network config
+        if [[ "$USE_VPN" == "y" ]]; then
+            ASTERISK_HOST="$VPN_IP"
+        else
+            ASTERISK_HOST=$(hostname -I | cut -d' ' -f1)
+        fi
+        ENABLE_TLS="n"
+        USE_COTURN="n"
+    fi
+
+    # Optional: COTURN setup
+    if [[ "$do_internet" =~ ^[Yy]$ ]]; then
+        echo ""
+        print_header "COTURN Setup (Optional)"
+        echo "COTURN is a TURN/STUN server for NAT traversal."
+        echo ""
+        echo -e "  ${YELLOW}⚠ COTURN is complex and usually NOT needed!${NC}"
+        echo ""
+        echo -e "  ${GREEN}You DON'T need COTURN if:${NC}"
+        echo "    • Using VPN (Tailscale, NetBird, WireGuard)"
+        echo "    • Simple port forwarding works for you"
+        echo "    • All devices on same network/VLANs"
+        echo ""
+        echo -e "  ${RED}You MIGHT need COTURN if:${NC}"
+        echo "    • VPN is not an option"
+        echo "    • Strict firewall/VLAN isolation"
+        echo "    • Symmetric NAT issues"
+        echo ""
+        read -p "Setup COTURN server? [y/N]: " do_coturn
+
+        if [[ "$do_coturn" =~ ^[Yy]$ ]]; then
+            install_coturn
+            USE_COTURN="y"
+        else
+            USE_COTURN="n"
+            print_info "Skipping COTURN (recommended for most users)"
+        fi
+    fi
+
+    # Configure everything
     configure_asterisk
     configure_baresip
     enable_client_services
@@ -2885,27 +2957,92 @@ install_full() {
         detect_ptt_button
     fi
 
-    echo ""
-    read -p "Run Internet/Certificate Setup wizard now? [Y/n]: " run_setup
-    [[ ! "$run_setup" =~ ^[Nn]$ ]] && setup_internet_access
-
     print_success "Installation complete"
 }
 
 install_server_only() {
     print_header "Server Installation"
-    ASTERISK_HOST="127.0.0.1"
-    ENABLE_TLS="y"
+
+    # Check for VPN first
+    echo ""
+    print_header "VPN Detection"
+    echo "VPNs (Tailscale, NetBird, WireGuard) are great for:"
+    echo "  • Connecting kiosks on different VLANs without COTURN"
+    echo "  • Allowing internet users to call internal kiosks"
+    echo "  • Avoiding complex firewall/NAT configuration"
+    echo ""
+    detect_vpn_interface || true
+
+    # Basic config
+    if ! collect_common_config; then return; fi
+
+    # Install base software
     install_asterisk_packages
+    INSTALLED_SERVER="y"
+
+    # Optional: Internet/FQDN setup
+    echo ""
+    print_header "Internet Access (Optional)"
+    echo "Do you want to setup internet calling with FQDN and TLS certificates?"
+    echo ""
+    echo -e "  ${GREEN}Choose YES if:${NC}"
+    echo "    • You want internet users to call your system"
+    echo "    • You have a domain name (FQDN)"
+    echo "    • You need TLS encryption"
+    echo ""
+    echo -e "  ${YELLOW}Choose NO if:${NC}"
+    echo "    • Local network only"
+    echo "    • Using VPN for remote access"
+    echo ""
+    read -p "Setup internet access with FQDN/certs? [y/N]: " do_internet
+
+    if [[ "$do_internet" =~ ^[Yy]$ ]]; then
+        setup_internet_access
+    else
+        # Local network config
+        if [[ "$USE_VPN" == "y" ]]; then
+            ASTERISK_HOST="$VPN_IP"
+        else
+            ASTERISK_HOST=$(hostname -I | cut -d' ' -f1)
+        fi
+        ENABLE_TLS="n"
+        USE_COTURN="n"
+    fi
+
+    # Optional: COTURN setup
+    if [[ "$do_internet" =~ ^[Yy]$ ]]; then
+        echo ""
+        print_header "COTURN Setup (Optional)"
+        echo "COTURN is a TURN/STUN server for NAT traversal."
+        echo ""
+        echo -e "  ${YELLOW}⚠ COTURN is complex and usually NOT needed!${NC}"
+        echo ""
+        echo -e "  ${GREEN}You DON'T need COTURN if:${NC}"
+        echo "    • Using VPN (Tailscale, NetBird, WireGuard)"
+        echo "    • Simple port forwarding works for you"
+        echo "    • All devices on same network/VLANs"
+        echo ""
+        echo -e "  ${RED}You MIGHT need COTURN if:${NC}"
+        echo "    • VPN is not an option"
+        echo "    • Strict firewall/VLAN isolation"
+        echo "    • Symmetric NAT issues"
+        echo ""
+        read -p "Setup COTURN server? [y/N]: " do_coturn
+
+        if [[ "$do_coturn" =~ ^[Yy]$ ]]; then
+            install_coturn
+            USE_COTURN="y"
+        else
+            USE_COTURN="n"
+            print_info "Skipping COTURN (recommended for most users)"
+        fi
+    fi
+
+    # Configure everything
     configure_asterisk
     open_firewall_ports
-    INSTALLED_SERVER="y"
     save_config
-    
-    echo ""
-    read -p "Run Internet/Certificate Setup wizard now? [Y/n]: " run_setup
-    [[ ! "$run_setup" =~ ^[Nn]$ ]] && setup_internet_access
-    
+
     print_success "Server installed"
 }
 
@@ -3033,7 +3170,7 @@ uninstall_menu() {
 
 show_main_menu() {
     clear
-    print_header "Easy Asterisk v1.25"
+    print_header "Easy Asterisk v1.26"
     
     load_config
     echo "  Status:"
@@ -3070,13 +3207,16 @@ show_main_menu() {
 submenu_install() {
     clear
     print_header "Install"
-    echo "  ${BOLD}1) Quick Local Setup (Recommended)${NC}"
-    echo "     └─ Local network, PTT, auto-answer - No internet needed"
+    echo -e "  ${BOLD}1) Quick Local Setup (Recommended)${NC}"
+    echo "     └─ Local LAN only - PTT, auto-answer, no internet/FQDN"
     echo ""
-    echo "  ${CYAN}Advanced Options:${NC}"
-    echo "  2) Full (server + client with internet setup)"
-    echo "  3) Server only"
-    echo "  4) Client only"
+    echo -e "  ${CYAN}Advanced Options:${NC}"
+    echo "  2) Full Setup (Server + Client + Internet)"
+    echo "     └─ Optionally add FQDN, TLS certs, COTURN for internet calling"
+    echo "  3) Server Only"
+    echo "     └─ Just Asterisk server (optionally with FQDN/internet)"
+    echo "  4) Client Only"
+    echo "     └─ Just Baresip client (connect to existing server)"
     echo "  5) Uninstall"
     echo "  0) Back"
     read -p "  Select: " choice
