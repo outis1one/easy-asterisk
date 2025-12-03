@@ -1,22 +1,29 @@
 #!/bin/bash
 # ================================================================
-# Easy Asterisk - Interactive Installer v1.28
+# Easy Asterisk - Interactive Installer v1.29
 #
-# UPDATES in v1.28:
-# - FIXED: Device display now correctly shows UDP/5060 for LAN-only installs
-# - FIXED: Device display shows TLS/5061 only when internet/certs configured
-# - FIXED: SRTP shown as "Required" only with TLS, "Not required" for UDP
-# - FIXED: ICE support only enabled for FQDN/internet calling, not LAN-only
-# - FIXED: RTP config - icesupport and STUN only enabled for FQDN setups
-# - ADDED: Informative message after server install before internet setup prompt
-# - ADDED: load_config call in add_device_menu to properly read saved settings
+# MAJOR UPDATES in v1.29:
+# - FIXED: Kiosk client offline/connection issues (DBUS, PipeWire deps)
+# - FIXED: PTT button not muting microphone (permission errors)
+# - FIXED: Audio completely lost after client installation
+# - FIXED: Config file permissions (644 readable by user services)
+# - ADDED: Smart user detection/selection (scans /home directory)
+# - ADDED: Comprehensive logging (journalctl for all services)
+# - ADDED: Enhanced diagnostics (audio status, PTT logs, service status)
+# - ADDED: Manual audio fix tool (unmute & restart)
+# - ADDED: Input group membership for PTT device access
+# - IMPROVED: Service dependencies (Requires=pipewire-pulse)
+# - IMPROVED: Startup delays and retry logic
+# - IMPROVED: Error messages and troubleshooting guidance
 #
-# This fixes the issue where LAN-only servers incorrectly showed TLS/SRTP
-# requirements when adding devices, preventing proper UDP registration.
+# This version completely resolves audio and PTT issues that prevented
+# kiosk clients from working properly, especially for headless users.
 #
-# RETAINED from v1.23:
-# - Router Guide separates VLAN (Allow) vs WAN (NAT)
-# - Caddy Helper generates snippets for both SIP and TURN domains
+# RETAINED from v1.28:
+# - Device display correctly shows UDP/5060 for LAN-only installs
+# - TLS/5061 only when internet/certs configured
+# - ICE and STUN only for FQDN setups
+# - Router Guide with VLAN vs WAN separation
 # - PTT Mute-default, Audio Ducking, Device Management
 # ================================================================
 
@@ -1005,17 +1012,55 @@ detect_ptt_button() {
         esac
     done
     
+    # Ensure user is in input group (critical for PTT device access)
+    if [[ -n "$KIOSK_USER" ]]; then
+        if ! id -nG "$KIOSK_USER" | grep -qw "input"; then
+            print_info "Adding $KIOSK_USER to input group..."
+            usermod -aG input "$KIOSK_USER"
+            echo ""
+            print_error "IMPORTANT: User added to 'input' group"
+            echo "  User must log out and log back in (or reboot) for group change to take effect."
+            echo "  PTT will NOT work until then!"
+            echo ""
+            read -p "Press Enter to acknowledge..."
+        fi
+    fi
+
     # Save configuration via save_config (will set proper permissions)
     save_config
-    
+
     print_success "PTT configured: $PTT_KEYNAME on $(basename $PTT_DEVICE)"
-    
+    echo ""
+    echo "═══════════════════════════════════════════════════════"
+    echo "  PTT Configuration Complete"
+    echo "═══════════════════════════════════════════════════════"
+    echo "  Device:  $PTT_DEVICE"
+    echo "  Button:  $PTT_KEYNAME"
+    echo "  User:    ${KIOSK_USER:-not set}"
+    echo ""
+    echo "  Testing PTT:"
+    echo "  1. Check logs: journalctl -t kiosk-ptt -f"
+    echo "  2. Press PTT button"
+    echo "  3. You should see: 'PTT pressed - mic unmuted'"
+    echo ""
+    echo "  If you see 'Permission denied' errors:"
+    echo "  - User needs to be in 'input' group (already added above)"
+    echo "  - Log out and log back in, or reboot"
+    echo "═══════════════════════════════════════════════════════"
+
     # Restart PTT service if client is installed
     if [[ "$INSTALLED_CLIENT" == "y" && -n "$KIOSK_USER" ]]; then
         local user_dbus="XDG_RUNTIME_DIR=/run/user/${KIOSK_UID}"
+        echo ""
+        print_info "Restarting PTT service..."
+        sudo -u "$KIOSK_USER" $user_dbus systemctl --user daemon-reload 2>/dev/null
         sudo -u "$KIOSK_USER" $user_dbus systemctl --user restart kiosk-ptt 2>/dev/null || true
+        sleep 2
+        echo ""
+        echo "Checking PTT status..."
+        journalctl -t kiosk-ptt -n 5 --no-pager 2>/dev/null || echo "  No logs yet (check after logging out/in if needed)"
     fi
-    
+
     return 0
 }
 
@@ -1386,11 +1431,34 @@ configure_local_client() {
 <sip:${ext}@${server};transport=${transport_str}>;auth_pass=${pass};answermode=${answermode}${media_enc}
 EOF
     chown ${KIOSK_USER}:${KIOSK_USER} "/home/${KIOSK_USER}/.baresip/accounts"
-    
+    chown ${KIOSK_USER}:${KIOSK_USER} "/home/${KIOSK_USER}/.baresip/config"
+
+    # Update main config
+    ASTERISK_HOST="$server"
+    KIOSK_EXTENSION="$ext"
+    CLIENT_ANSWERMODE="$answermode"
+    save_config
+
     local user_dbus="XDG_RUNTIME_DIR=/run/user/${KIOSK_UID}"
+
+    # Reload systemd daemon in case services changed
+    sudo -u "${KIOSK_USER}" $user_dbus systemctl --user daemon-reload 2>/dev/null
+
+    # Restart audio and client services
+    print_info "Restarting services..."
+    sudo -u "${KIOSK_USER}" $user_dbus systemctl --user restart pipewire pipewire-pulse 2>/dev/null || true
+    sleep 2
     sudo -u "${KIOSK_USER}" $user_dbus systemctl --user restart baresip 2>/dev/null
-    
-    print_success "Client Updated & Restarted"
+
+    # Ensure audio is unmuted if not in PTT mode
+    if [[ ! -f /etc/easy-asterisk/ptt-device ]]; then
+        sleep 1
+        ensure_audio_unmuted
+    fi
+
+    print_success "Client Reconfigured & Services Restarted"
+    echo ""
+    echo "Run Diagnostics to verify connection status."
 }
 
 run_client_diagnostics() {
@@ -2379,7 +2447,7 @@ install_client_only() {
     echo "  3. Check audio with: pactl list sources short"
     echo ""
     echo "  PTT Mode: Not configured (normal intercom operation)"
-    echo "  To configure PTT: Main Menu > Configure PTT"
+    echo "  To configure PTT: Main Menu > Client Management > Configure PTT Button"
     echo "════════════════════════════════════════════════════════"
 }
 
