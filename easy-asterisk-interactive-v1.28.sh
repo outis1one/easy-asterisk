@@ -168,6 +168,8 @@ backup_config() {
 
 save_config() {
     mkdir -p "$CONFIG_DIR"
+    chmod 755 "$CONFIG_DIR"
+
     cat > "$CONFIG_FILE" << EOF
 # Easy Asterisk Configuration - $(date)
 KIOSK_USER="$KIOSK_USER"
@@ -193,15 +195,15 @@ PTT_DEVICE="$PTT_DEVICE"
 PTT_KEYCODE="$PTT_KEYCODE"
 LOCAL_CIDR="$LOCAL_CIDR"
 EOF
-    chmod 600 "$CONFIG_FILE"
-    
+    chmod 644 "$CONFIG_FILE"
+
     # Save PTT config separately
     if [[ -n "$PTT_DEVICE" ]]; then
         cat > "$PTT_CONFIG_FILE" << EOF
 PTT_DEVICE="$PTT_DEVICE"
 PTT_KEYCODE="$PTT_KEYCODE"
 EOF
-        chmod 600 "$PTT_CONFIG_FILE"
+        chmod 644 "$PTT_CONFIG_FILE"
     fi
 }
 
@@ -1003,16 +1005,7 @@ detect_ptt_button() {
         esac
     done
     
-    # Save configuration
-    mkdir -p "$(dirname "$PTT_CONFIG_FILE")"
-    cat > "$PTT_CONFIG_FILE" << EOF
-PTT_DEVICE="$PTT_DEVICE"
-PTT_KEYCODE="$PTT_KEYCODE"
-PTT_KEYNAME="$PTT_KEYNAME"
-EOF
-    chmod 600 "$PTT_CONFIG_FILE"
-    
-    # Also save to main config
+    # Save configuration via save_config (will set proper permissions)
     save_config
     
     print_success "PTT configured: $PTT_KEYNAME on $(basename $PTT_DEVICE)"
@@ -1983,6 +1976,11 @@ enable_client_services() {
     # Ensure audio group membership
     if ! id -nG "$KIOSK_USER" | grep -qw "audio"; then
         usermod -aG audio "$KIOSK_USER"
+    fi
+
+    # Ensure input group membership (for PTT device access)
+    if ! id -nG "$KIOSK_USER" | grep -qw "input"; then
+        usermod -aG input "$KIOSK_USER"
     fi
 
     # Baresip service
