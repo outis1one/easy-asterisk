@@ -2048,21 +2048,18 @@ user_agent=EasyAsterisk
 type=transport
 protocol=udp
 bind=0.0.0.0:${DEFAULT_SIP_PORT}
-ice_support=yes
 ${nat_settings}
 
 [transport-tcp]
 type=transport
 protocol=tcp
 bind=0.0.0.0:${DEFAULT_SIP_PORT}
-ice_support=yes
 ${nat_settings}
 
 [transport-tls]
 type=transport
 protocol=tls
 bind=0.0.0.0:${DEFAULT_SIPS_PORT}
-ice_support=yes
 cert_file=/etc/asterisk/certs/server.crt
 priv_key_file=/etc/asterisk/certs/server.key
 ca_list_file=/etc/ssl/certs/ca-certificates.crt
