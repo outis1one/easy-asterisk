@@ -959,9 +959,11 @@ CONFIG="/etc/easy-asterisk/config"
 PTT_CONFIG="/etc/easy-asterisk/ptt-device"
 [[ -f "$CONFIG" ]] && source "$CONFIG"
 [[ -f "$PTT_CONFIG" ]] && source "$PTT_CONFIG"
+
+# Exit if no PTT device configured - leave audio unmuted for normal kiosk operation
 [[ -z "$PTT_DEVICE" ]] && exit 0
 
-# Default: Mute audio source on start
+# PTT mode: Mute audio source on start, unmute only when button pressed
 pactl set-source-mute @DEFAULT_SOURCE@ 1
 
 # Unmute on press, mute on release
