@@ -293,15 +293,15 @@ detect_vpn_interface() {
     echo "╚════════════════════════════════════════════════════════════╝"
     echo ""
     echo "For VPN to work, you must install it on:"
-    echo "  ${BOLD}1. This Asterisk server${NC} ${GREEN}✓${NC} (detected above)"
-    echo "  ${BOLD}2. ALL kiosk/client devices${NC}"
+    echo -e "  ${BOLD}1. This Asterisk server${NC} ${GREEN}✓${NC} (detected above)"
+    echo -e "  ${BOLD}2. ALL kiosk/client devices${NC}"
     echo ""
     echo "Benefits of using VPN:"
-    echo "  ${GREEN}✓${NC} No COTURN needed (simpler setup)"
-    echo "  ${GREEN}✓${NC} No port forwarding needed (more secure)"
-    echo "  ${GREEN}✓${NC} No public IP/DNS issues (works with dynamic IP)"
-    echo "  ${GREEN}✓${NC} Works across VLANs automatically"
-    echo "  ${GREEN}✓${NC} Internet users can still call in via FQDN"
+    echo -e "  ${GREEN}✓${NC} No COTURN needed (simpler setup)"
+    echo -e "  ${GREEN}✓${NC} No port forwarding needed (more secure)"
+    echo -e "  ${GREEN}✓${NC} No public IP/DNS issues (works with dynamic IP)"
+    echo -e "  ${GREEN}✓${NC} Works across VLANs automatically"
+    echo -e "  ${GREEN}✓${NC} Internet users can still call in via FQDN"
     echo ""
     echo "How it works:"
     echo "  • Clients register to Asterisk using VPN IP"
@@ -344,12 +344,12 @@ check_ip_type_and_dns() {
     print_header "IP Address Configuration"
 
     local current_ip=$(get_public_ip)
-    [[ -n "$current_ip" ]] && echo "Your current public IP: ${BOLD}$current_ip${NC}"
+    [[ -n "$current_ip" ]] && echo -e "Your current public IP: ${BOLD}$current_ip${NC}"
     echo ""
 
     echo "Do you have a STATIC or DYNAMIC public IP address?"
-    echo "  ${BOLD}Static${NC}:  IP never changes (common with business internet)"
-    echo "  ${BOLD}Dynamic${NC}: IP changes periodically (common with residential internet)"
+    echo -e "  ${BOLD}Static${NC}:  IP never changes (common with business internet)"
+    echo -e "  ${BOLD}Dynamic${NC}: IP changes periodically (common with residential internet)"
     echo ""
     echo "Not sure? Check with your ISP or wait 24-48 hours and run 'curl ifconfig.me'"
     echo "to see if your IP changed."
@@ -674,12 +674,12 @@ configure_coturn_menu() {
         echo "║             Do you ACTUALLY need COTURN?                  ║"
         echo "╚════════════════════════════════════════════════════════════╝"
         echo ""
-        echo "${RED}✗ You DON'T need COTURN if:${NC}"
+        echo -e "${RED}✗ You DON'T need COTURN if:${NC}"
         echo "  • Local network only"
         echo "  • Using VPN (Tailscale/WireGuard)"
         echo "  • Server has public IP + simple port forwarding"
         echo ""
-        echo "${GREEN}✓ You DO need COTURN if:${NC}"
+        echo -e "${GREEN}✓ You DO need COTURN if:${NC}"
         echo "  • Symmetric NAT / strict firewall"
         echo "  • VLAN isolation (like OPNsense example)"
         echo "  • Corporate network with limited ports"
@@ -2793,11 +2793,11 @@ install_quick_local() {
     print_header "Quick Local Network Setup"
 
     echo "This is the recommended setup for 90% of users:"
-    echo "  ${GREEN}✓${NC} Local network only (no internet)"
-    echo "  ${GREEN}✓${NC} PTT (push-to-talk) with mute-by-default"
-    echo "  ${GREEN}✓${NC} Auto-answer for kiosks"
-    echo "  ${GREEN}✓${NC} Audio ducking"
-    echo "  ${GREEN}✓${NC} No COTURN/certificates needed"
+    echo -e "  ${GREEN}✓${NC} Local network only (no internet)"
+    echo -e "  ${GREEN}✓${NC} PTT (push-to-talk) with mute-by-default"
+    echo -e "  ${GREEN}✓${NC} Auto-answer for kiosks"
+    echo -e "  ${GREEN}✓${NC} Audio ducking"
+    echo -e "  ${GREEN}✓${NC} No COTURN/certificates needed"
     echo ""
     echo "Perfect for:"
     echo "  • Intercom systems"
@@ -2805,17 +2805,31 @@ install_quick_local() {
     echo "  • Office quick-call systems"
     echo "  • Security/monitoring stations"
     echo ""
-    read -p "Continue with quick setup? [Y/n]: " confirm
-    [[ "$confirm" =~ ^[Nn]$ ]] && return
+    echo "What would you like to install?"
+    echo "  1) Server + Client (Combined - This machine will host and use Asterisk)"
+    echo "  2) Server Only (This machine will only host Asterisk)"
+    echo "  0) Cancel"
+    read -p "Select [1]: " install_mode
+    install_mode="${install_mode:-1}"
+
+    case "$install_mode" in
+        0) return ;;
+        2)
+            # Server only - no client user needed
+            KIOSK_USER=""
+            KIOSK_UID=""
+            ;;
+        *)
+            # Combined - need client user
+            local default_user="${SUDO_USER:-$USER}"
+            read -p "Client User [$default_user]: " target_user
+            KIOSK_USER="${target_user:-$default_user}"
+            KIOSK_UID=$(id -u "$KIOSK_USER")
+            ;;
+    esac
 
     # Check for VPN first
     detect_vpn_interface || true
-
-    # Get client user
-    local default_user="${SUDO_USER:-$USER}"
-    read -p "Client User [$default_user]: " target_user
-    KIOSK_USER="${target_user:-$default_user}"
-    KIOSK_UID=$(id -u "$KIOSK_USER")
 
     # Simple config
     if [[ "$USE_VPN" == "y" ]]; then
@@ -2830,20 +2844,30 @@ install_quick_local() {
     USE_COTURN="n"
     USE_GOOGLE_STUN="n"
 
-    # Install
-    install_dependencies
-    INSTALLED_SERVER="y"
-    INSTALLED_CLIENT="y"
-    configure_asterisk
-    configure_baresip
-    enable_client_services
-    open_firewall_ports
+    # Install based on mode
+    if [[ "$install_mode" == "2" ]]; then
+        # Server only
+        install_asterisk_packages
+        INSTALLED_SERVER="y"
+        INSTALLED_CLIENT="n"
+        configure_asterisk
+        open_firewall_ports
+    else
+        # Combined server + client
+        install_dependencies
+        INSTALLED_SERVER="y"
+        INSTALLED_CLIENT="y"
+        configure_asterisk
+        configure_baresip
+        enable_client_services
+        open_firewall_ports
 
-    # Configure PTT
-    echo ""
-    read -p "Configure PTT button now? [Y/n]: " do_ptt
-    if [[ ! "$do_ptt" =~ ^[Nn]$ ]]; then
-        detect_ptt_button
+        # Configure PTT
+        echo ""
+        read -p "Configure PTT button now? [Y/n]: " do_ptt
+        if [[ ! "$do_ptt" =~ ^[Nn]$ ]]; then
+            detect_ptt_button
+        fi
     fi
 
     save_config
@@ -2851,11 +2875,12 @@ install_quick_local() {
     print_success "Quick setup complete!"
     echo ""
     echo "═══════════════════════════════════════════════════════════"
-    echo "Your Asterisk server is running on: ${BOLD}$ASTERISK_HOST${NC}"
-    echo "  Extension: 101"
-    echo "  Password:  $SIP_PASSWORD"
-    echo ""
-    echo "Add more devices: Main Menu → Device Management → Add device"
+    echo -e "Your Asterisk server is running on: ${BOLD}$ASTERISK_HOST${NC}"
+    if [[ "$install_mode" != "2" ]]; then
+        echo "  Extension: 101"
+        echo "  Password:  $SIP_PASSWORD"
+    fi
+    echo "  • Add more devices: Main Menu → Device Management"
     echo "═══════════════════════════════════════════════════════════"
 }
 
@@ -3135,14 +3160,33 @@ uninstall_menu() {
     read -p "Select: " ch
     case $ch in
         1)
-            systemctl stop asterisk 2>/dev/null || true
-            apt purge -y asterisk* baresip baresip-core 2>/dev/null || true
+            # Load config to get KIOSK_USER and KIOSK_UID
+            load_config
+
+            # Stop user services first (if client was installed)
+            if [[ -n "$KIOSK_USER" && -n "$KIOSK_UID" ]]; then
+                local user_dbus="XDG_RUNTIME_DIR=/run/user/${KIOSK_UID}"
+                sudo -u "$KIOSK_USER" $user_dbus systemctl --user stop baresip kiosk-ptt 2>/dev/null || true
+                sudo -u "$KIOSK_USER" $user_dbus systemctl --user disable baresip kiosk-ptt 2>/dev/null || true
+            fi
+
+            # Stop system services
+            systemctl stop asterisk coturn 2>/dev/null || true
+            systemctl disable asterisk coturn 2>/dev/null || true
+
+            # Remove packages
+            apt purge -y asterisk* baresip baresip-core coturn 2>/dev/null || true
+            apt autoremove -y 2>/dev/null || true
+
+            # Remove directories
             rm -rf /etc/asterisk /var/lib/asterisk /var/log/asterisk /var/spool/asterisk /usr/lib/asterisk
-            rm -rf /etc/systemd/system/asterisk.service.d /etc/easy-asterisk
+            rm -rf /etc/systemd/system/asterisk.service.d /etc/easy-asterisk /etc/turnserver.conf
             [[ -n "$KIOSK_USER" ]] && rm -rf "/home/${KIOSK_USER}/.baresip"
+
             systemctl daemon-reload
             INSTALLED_SERVER="n"
             INSTALLED_CLIENT="n"
+            INSTALLED_COTURN="n"
             rm -f "$CONFIG_FILE"
             print_success "Removed all"
             ;;
