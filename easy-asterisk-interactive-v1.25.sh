@@ -1,8 +1,34 @@
 #!/bin/bash
 # ================================================================
-# Easy Asterisk - Interactive Installer v1.24
+# Easy Asterisk - Interactive Installer v1.25
 #
-# UPDATES in v1.24:
+# UPDATES in v1.25:
+# - QUICK LOCAL SETUP: New recommended installation path (90% use case)
+#   * One-click local network setup
+#   * PTT with mute-by-default
+#   * Auto-answer for kiosks
+#   * Audio ducking
+#   * No COTURN/internet/certificates needed
+#   * Perfect for intercoms, warehouses, offices
+#
+# - VPN DETECTION: Automatic VPN interface detection
+#   * Detects Tailscale, WireGuard, OpenVPN
+#   * Offers to bind Asterisk to VPN IP
+#   * Shows benefits of VPN vs COTURN
+#   * Stores VPN config (USE_VPN, VPN_INTERFACE, VPN_IP)
+#
+# - SIMPLIFIED COTURN GUIDANCE: Crystal-clear when you need it
+#   * Shows "Do you ACTUALLY need COTURN?" with examples
+#   * ✗ DON'T need: Local network, VPN, simple NAT
+#   * ✓ DO need: Symmetric NAT, VLAN isolation, corporate firewall
+#   * Changed default prompt from [Y/n] to [y/N] (opt-in not opt-out)
+#
+# - TURN DOMAIN: Defaults to SIP domain (same domain is fine!)
+#   * TURN_DOMAIN defaults to DOMAIN_NAME
+#   * Explains single vs separate domain options
+#   * Warns if using separate domains about cert coverage
+#
+# RETAINED from v1.24:
 # - COMPREHENSIVE: Complete OPNsense/pfSense VLAN configuration guide
 #   * Full network topology documentation (LAN + VLAN 20/30/40)
 #   * Step-by-step firewall rules for VLAN isolation
@@ -102,6 +128,9 @@ load_config() {
     KIOSK_USER="${KIOSK_USER:-}"
     KIOSK_UID="${KIOSK_UID:-}"
     USE_COTURN="${USE_COTURN:-n}"
+    USE_VPN="${USE_VPN:-n}"
+    VPN_INTERFACE="${VPN_INTERFACE:-}"
+    VPN_IP="${VPN_IP:-}"
     TURN_SECRET="${TURN_SECRET:-}"
     TURN_USER="${TURN_USER:-kioskuser}"
     TURN_PASS="${TURN_PASS:-}"
@@ -139,6 +168,9 @@ INSTALLED_SERVER="$INSTALLED_SERVER"
 INSTALLED_CLIENT="$INSTALLED_CLIENT"
 INSTALLED_COTURN="$INSTALLED_COTURN"
 USE_COTURN="$USE_COTURN"
+USE_VPN="$USE_VPN"
+VPN_INTERFACE="$VPN_INTERFACE"
+VPN_IP="$VPN_IP"
 USE_GOOGLE_STUN="$USE_GOOGLE_STUN"
 IP_TYPE="$IP_TYPE"
 HAS_DYNAMIC_DNS="$HAS_DYNAMIC_DNS"
@@ -183,8 +215,81 @@ open_firewall_ports() {
 }
 
 # ================================================================
-# 2. COTURN SETUP & DYNAMIC IP
+# 2. VPN & NETWORK DETECTION
 # ================================================================
+
+detect_vpn_interface() {
+    print_header "VPN Detection"
+
+    # Check for common VPN interfaces
+    local vpn_interfaces=()
+    local vpn_ips=()
+
+    # Tailscale
+    if ip link show tailscale0 &>/dev/null; then
+        local ts_ip=$(ip -4 addr show tailscale0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        if [[ -n "$ts_ip" ]]; then
+            vpn_interfaces+=("tailscale0")
+            vpn_ips+=("$ts_ip")
+        fi
+    fi
+
+    # WireGuard
+    for wg_if in $(ip link show | grep -oP 'wg\d+|wireguard\d+' | sort -u); do
+        local wg_ip=$(ip -4 addr show "$wg_if" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        if [[ -n "$wg_ip" ]]; then
+            vpn_interfaces+=("$wg_if")
+            vpn_ips+=("$wg_ip")
+        fi
+    done
+
+    # OpenVPN (tun/tap)
+    for tun_if in $(ip link show | grep -oP 'tun\d+|tap\d+' | sort -u); do
+        local tun_ip=$(ip -4 addr show "$tun_if" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        if [[ -n "$tun_ip" ]]; then
+            vpn_interfaces+=("$tun_if")
+            vpn_ips+=("$tun_ip")
+        fi
+    done
+
+    if [[ ${#vpn_interfaces[@]} -eq 0 ]]; then
+        echo "No VPN interfaces detected."
+        return 1
+    fi
+
+    echo "Detected VPN interface(s):"
+    for i in "${!vpn_interfaces[@]}"; do
+        echo "  $((i+1))) ${vpn_interfaces[$i]} → ${vpn_ips[$i]}"
+    done
+    echo ""
+    echo "Using a VPN simplifies your setup:"
+    echo "  ${GREEN}✓${NC} No COTURN needed"
+    echo "  ${GREEN}✓${NC} No port forwarding needed"
+    echo "  ${GREEN}✓${NC} No public IP/DNS issues"
+    echo "  ${GREEN}✓${NC} Works across VLANs automatically"
+    echo ""
+    read -p "Use VPN interface for Asterisk? [Y/n]: " use_vpn
+
+    if [[ ! "$use_vpn" =~ ^[Nn]$ ]]; then
+        if [[ ${#vpn_interfaces[@]} -eq 1 ]]; then
+            VPN_INTERFACE="${vpn_interfaces[0]}"
+            VPN_IP="${vpn_ips[0]}"
+        else
+            read -p "Select interface [1-${#vpn_interfaces[@]}]: " vpn_choice
+            vpn_choice=$((vpn_choice - 1))
+            VPN_INTERFACE="${vpn_interfaces[$vpn_choice]}"
+            VPN_IP="${vpn_ips[$vpn_choice]}"
+        fi
+
+        ASTERISK_HOST="$VPN_IP"
+        USE_VPN="y"
+        print_success "VPN Mode: Asterisk will bind to $VPN_INTERFACE ($VPN_IP)"
+        save_config
+        return 0
+    fi
+
+    return 1
+}
 
 get_public_ip() {
     local ip=$(curl -s -4 --connect-timeout 5 ifconfig.me 2>/dev/null || curl -s -4 --connect-timeout 5 icanhazip.com 2>/dev/null || echo "")
@@ -521,9 +626,27 @@ configure_coturn_menu() {
             5) uninstall_coturn ;;
         esac
     else
-        echo "COTURN is not installed."
-        read -p "Install now? [Y/n]: " install
-        if [[ ! "$install" =~ ^[Nn]$ ]]; then
+        echo "╔════════════════════════════════════════════════════════════╗"
+        echo "║             Do you ACTUALLY need COTURN?                  ║"
+        echo "╚════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "${RED}✗ You DON'T need COTURN if:${NC}"
+        echo "  • Local network only"
+        echo "  • Using VPN (Tailscale/WireGuard)"
+        echo "  • Server has public IP + simple port forwarding"
+        echo ""
+        echo "${GREEN}✓ You DO need COTURN if:${NC}"
+        echo "  • Symmetric NAT / strict firewall"
+        echo "  • VLAN isolation (like OPNsense example)"
+        echo "  • Corporate network with limited ports"
+        echo ""
+        echo "COTURN requires:"
+        echo "  • Domain name (FQDN)"
+        echo "  • Static IP OR Dynamic DNS"
+        echo "  • Port forwarding (3478, 49152-65535)"
+        echo ""
+        read -p "Install COTURN anyway? [y/N]: " install
+        if [[ "$install" =~ ^[Yy]$ ]]; then
             install_coturn
             if [[ "$INSTALLED_COTURN" == "y" ]]; then
                 create_ip_update_script
@@ -2183,9 +2306,18 @@ setup_internet_access() {
     ASTERISK_HOST="$DOMAIN_NAME"
     
     echo ""
-    echo "Do you have a separate domain for TURN? (e.g., turn.example.com)"
-    read -p "Enter TURN domain (leave empty to use $DOMAIN_NAME): " t_dom
+    echo "TURN domain (for COTURN server):"
+    echo "  → Press Enter to use same domain: ${DOMAIN_NAME}"
+    echo "  → Or enter separate domain (e.g., turn.example.com)"
+    read -p "TURN domain [$DOMAIN_NAME]: " t_dom
     TURN_DOMAIN="${t_dom:-$DOMAIN_NAME}"
+
+    if [[ "$TURN_DOMAIN" == "$DOMAIN_NAME" ]]; then
+        print_info "Using single domain for both SIP and TURN: $DOMAIN_NAME"
+    else
+        print_info "Separate domains: SIP=$DOMAIN_NAME, TURN=$TURN_DOMAIN"
+        print_warn "Make sure your certificate covers BOTH domains!"
+    fi
     
     # CIDR Prompt
     echo ""
@@ -2302,13 +2434,86 @@ setup_internet_access() {
 # 10. INSTALLATION
 # ================================================================
 
+install_quick_local() {
+    print_header "Quick Local Network Setup"
+
+    echo "This is the recommended setup for 90% of users:"
+    echo "  ${GREEN}✓${NC} Local network only (no internet)"
+    echo "  ${GREEN}✓${NC} PTT (push-to-talk) with mute-by-default"
+    echo "  ${GREEN}✓${NC} Auto-answer for kiosks"
+    echo "  ${GREEN}✓${NC} Audio ducking"
+    echo "  ${GREEN}✓${NC} No COTURN/certificates needed"
+    echo ""
+    echo "Perfect for:"
+    echo "  • Intercom systems"
+    echo "  • Warehouse communication"
+    echo "  • Office quick-call systems"
+    echo "  • Security/monitoring stations"
+    echo ""
+    read -p "Continue with quick setup? [Y/n]: " confirm
+    [[ "$confirm" =~ ^[Nn]$ ]] && return
+
+    # Check for VPN first
+    detect_vpn_interface || true
+
+    # Get client user
+    local default_user="${SUDO_USER:-$USER}"
+    read -p "Client User [$default_user]: " target_user
+    KIOSK_USER="${target_user:-$default_user}"
+    KIOSK_UID=$(id -u "$KIOSK_USER")
+
+    # Simple config
+    if [[ "$USE_VPN" == "y" ]]; then
+        ASTERISK_HOST="$VPN_IP"
+    else
+        ASTERISK_HOST=$(hostname -I | cut -d' ' -f1)
+    fi
+
+    SIP_PASSWORD=$(generate_password)
+    ENABLE_TLS="n"
+    CLIENT_ANSWERMODE="auto"
+    USE_COTURN="n"
+    USE_GOOGLE_STUN="n"
+
+    # Install
+    install_dependencies
+    INSTALLED_SERVER="y"
+    INSTALLED_CLIENT="y"
+    configure_asterisk
+    configure_baresip
+    enable_client_services
+    open_firewall_ports
+
+    # Configure PTT
+    echo ""
+    read -p "Configure PTT button now? [Y/n]: " do_ptt
+    if [[ ! "$do_ptt" =~ ^[Nn]$ ]]; then
+        detect_ptt_button
+    fi
+
+    save_config
+
+    print_success "Quick setup complete!"
+    echo ""
+    echo "═══════════════════════════════════════════════════════════"
+    echo "Your Asterisk server is running on: ${BOLD}$ASTERISK_HOST${NC}"
+    echo "  Extension: 101"
+    echo "  Password:  $SIP_PASSWORD"
+    echo ""
+    echo "Add more devices: Main Menu → Device Management → Add device"
+    echo "═══════════════════════════════════════════════════════════"
+}
+
 install_full() {
     print_header "Full Installation"
     local default_user="${SUDO_USER:-$USER}"
     read -p "Client User [$default_user]: " target_user
     KIOSK_USER="${target_user:-$default_user}"
     KIOSK_UID=$(id -u "$KIOSK_USER")
-    
+
+    # Check for VPN
+    detect_vpn_interface || true
+
     if ! collect_common_config; then return; fi
     collect_client_config
     install_dependencies
@@ -2319,11 +2524,11 @@ install_full() {
     enable_client_services
     open_firewall_ports
     save_config
-    
+
     echo ""
     read -p "Run Internet/Certificate Setup wizard now? [Y/n]: " run_setup
     [[ ! "$run_setup" =~ ^[Nn]$ ]] && setup_internet_access
-    
+
     print_success "Installation complete"
 }
 
@@ -2460,7 +2665,7 @@ uninstall_menu() {
 
 show_main_menu() {
     clear
-    print_header "Easy Asterisk v1.23"
+    print_header "Easy Asterisk v1.25"
     
     load_config
     echo "  Status:"
@@ -2497,17 +2702,22 @@ show_main_menu() {
 submenu_install() {
     clear
     print_header "Install"
-    echo "  1) Full (server + client)"
-    echo "  2) Server only"
-    echo "  3) Client only"
-    echo "  4) Uninstall"
+    echo "  ${BOLD}1) Quick Local Setup (Recommended)${NC}"
+    echo "     └─ Local network, PTT, auto-answer - No internet needed"
+    echo ""
+    echo "  ${CYAN}Advanced Options:${NC}"
+    echo "  2) Full (server + client with internet setup)"
+    echo "  3) Server only"
+    echo "  4) Client only"
+    echo "  5) Uninstall"
     echo "  0) Back"
     read -p "  Select: " choice
     case $choice in
-        1) install_full; read -p "Press Enter..." ;;
-        2) install_server_only; read -p "Press Enter..." ;;
-        3) install_client_only; read -p "Press Enter..." ;;
-        4) uninstall_menu; read -p "Press Enter..." ;;
+        1) install_quick_local; read -p "Press Enter..." ;;
+        2) install_full; read -p "Press Enter..." ;;
+        3) install_server_only; read -p "Press Enter..." ;;
+        4) install_client_only; read -p "Press Enter..." ;;
+        5) uninstall_menu; read -p "Press Enter..." ;;
     esac
 }
 
