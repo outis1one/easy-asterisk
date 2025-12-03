@@ -969,11 +969,13 @@ max_contacts=5
 remove_existing=yes
 qualify_frequency=60
 EOF
-    
+
     chown -R asterisk:asterisk /etc/asterisk
+    echo ""
+    print_info "Reloading Asterisk configuration (this may take a moment)..."
     asterisk -rx "pjsip reload" >/dev/null 2>&1
     rebuild_dialplan
-    
+
     echo "════════════════════════════════════════════════════════"
     echo "  DEVICE ADDED"
     echo "════════════════════════════════════════════════════════"
@@ -3071,12 +3073,15 @@ submenu_install() {
     clear
     print_header "Install"
     echo "  ${BOLD}1) Quick Local Setup (Recommended)${NC}"
-    echo "     └─ Local network, PTT, auto-answer - No internet needed"
+    echo "     └─ Local LAN only - PTT, auto-answer, no internet/FQDN"
     echo ""
     echo "  ${CYAN}Advanced Options:${NC}"
-    echo "  2) Full (server + client with internet setup)"
-    echo "  3) Server only"
-    echo "  4) Client only"
+    echo "  2) Full Setup (Server + Client + Internet)"
+    echo "     └─ With FQDN, TLS certs, COTURN, internet calling"
+    echo "  3) Server Only"
+    echo "     └─ Just Asterisk server (optionally with FQDN/internet)"
+    echo "  4) Client Only"
+    echo "     └─ Just Baresip client (connect to existing server)"
     echo "  5) Uninstall"
     echo "  0) Back"
     read -p "  Select: " choice
