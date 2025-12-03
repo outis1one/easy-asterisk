@@ -3072,12 +3072,12 @@ show_main_menu() {
 submenu_install() {
     clear
     print_header "Install"
-    echo "  ${BOLD}1) Quick Local Setup (Recommended)${NC}"
+    echo -e "  ${BOLD}1) Quick Local Setup (Recommended)${NC}"
     echo "     └─ Local LAN only - PTT, auto-answer, no internet/FQDN"
     echo ""
-    echo "  ${CYAN}Advanced Options:${NC}"
+    echo -e "  ${CYAN}Advanced Options:${NC}"
     echo "  2) Full Setup (Server + Client + Internet)"
-    echo "     └─ With FQDN, TLS certs, COTURN, internet calling"
+    echo "     └─ Optionally add FQDN, TLS certs, COTURN for internet calling"
     echo "  3) Server Only"
     echo "     └─ Just Asterisk server (optionally with FQDN/internet)"
     echo "  4) Client Only"
