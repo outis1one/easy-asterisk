@@ -1577,8 +1577,34 @@ test_sip_connectivity() {
         echo -e "   ${GREEN}✓${NC} Running"
     else
         echo -e "   ${RED}✗${NC} NOT RUNNING!"
-        echo "   Fix: systemctl restart asterisk"
-        return
+
+        # Check for leftover processes
+        if pgrep -x asterisk >/dev/null 2>&1; then
+            echo -e "   ${YELLOW}⚠${NC} Found leftover Asterisk process"
+            echo ""
+            read -p "   Kill leftover process and restart Asterisk? [Y/n]: " fix_it
+            if [[ ! "$fix_it" =~ ^[Nn]$ ]]; then
+                echo "   Killing leftover processes..."
+                pkill -9 asterisk
+                sleep 2
+                echo "   Starting Asterisk..."
+                systemctl start asterisk
+                sleep 3
+                if systemctl is-active asterisk >/dev/null 2>&1; then
+                    echo -e "   ${GREEN}✓${NC} Asterisk started successfully!"
+                else
+                    echo -e "   ${RED}✗${NC} Failed to start. Check logs:"
+                    echo "      journalctl -xeu asterisk.service"
+                    return
+                fi
+            else
+                echo "   Manual fix: pkill -9 asterisk && systemctl start asterisk"
+                return
+            fi
+        else
+            echo "   Fix: systemctl start asterisk"
+            return
+        fi
     fi
 
     # 2. Port Listening Check
@@ -1631,6 +1657,7 @@ test_sip_connectivity() {
     echo "═══════════════════════════════════════════════════════════"
     echo "Quick Fixes:"
     echo "  • Restart Asterisk: systemctl restart asterisk"
+    echo "  • Kill stuck process: pkill -9 asterisk"
     echo "  • Watch live: asterisk -rvvv (then try phone registration)"
     echo "  • Enable verbose: asterisk -rx 'core set verbose 5'"
     echo "═══════════════════════════════════════════════════════════"
