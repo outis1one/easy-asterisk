@@ -1037,16 +1037,43 @@ PTT_CONFIG="/etc/easy-asterisk/ptt-device"
 # Exit if no PTT device configured - leave audio unmuted for normal kiosk operation
 [[ -z "$PTT_DEVICE" ]] && exit 0
 
+# Ensure we have the user's runtime directory
+if [[ -z "$XDG_RUNTIME_DIR" ]]; then
+    # If running as systemd service, this should already be set
+    # But if not, try to detect it
+    if [[ -n "$KIOSK_UID" ]]; then
+        export XDG_RUNTIME_DIR="/run/user/${KIOSK_UID}"
+    else
+        # Fall back to current user
+        export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    fi
+fi
+
+# Wait for PipeWire/PulseAudio to be ready
+for i in {1..10}; do
+    if pactl info >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
 # PTT mode: Mute audio source on start, unmute only when button pressed
-pactl set-source-mute @DEFAULT_SOURCE@ 1
+pactl set-source-mute @DEFAULT_SOURCE@ 1 2>/dev/null || {
+    logger -t kiosk-ptt "ERROR: Failed to mute audio source"
+    exit 1
+}
+
+logger -t kiosk-ptt "PTT handler started, microphone muted, listening on $PTT_DEVICE"
 
 # Unmute on press, mute on release
 evtest --grab "$PTT_DEVICE" 2>/dev/null | while read -r line; do
     if [[ "$line" =~ "value 1" ]]; then
-        pactl set-source-mute @DEFAULT_SOURCE@ 0
+        pactl set-source-mute @DEFAULT_SOURCE@ 0 2>/dev/null
+        logger -t kiosk-ptt "PTT pressed - mic unmuted"
     fi
     if [[ "$line" =~ "value 0" ]]; then
-        pactl set-source-mute @DEFAULT_SOURCE@ 1
+        pactl set-source-mute @DEFAULT_SOURCE@ 1 2>/dev/null
+        logger -t kiosk-ptt "PTT released - mic muted"
     fi
 done
 PTTSCRIPT
@@ -1447,8 +1474,20 @@ run_client_diagnostics() {
         fi
     fi
     echo "---------------------------------------------------"
-    echo "Last 15 lines of log:"
-    sudo -u "$t_user" journalctl --user -u baresip -n 15 --no-pager 2>/dev/null || echo "  No logs"
+    echo "System Logs (launcher):"
+    journalctl -t baresip-launcher -n 10 --no-pager 2>/dev/null | tail -10 || echo "  No launcher logs"
+    echo ""
+    echo "System Logs (PTT):"
+    journalctl -t kiosk-ptt -n 5 --no-pager 2>/dev/null | tail -5 || echo "  No PTT logs"
+    echo ""
+    echo "Baresip Service Log:"
+    sudo -u "$t_user" journalctl --user -u baresip -n 10 --no-pager 2>/dev/null || echo "  No logs"
+    echo "---------------------------------------------------"
+    echo ""
+    echo "To see live logs, run:"
+    echo "  journalctl -t baresip-launcher -f  # Launcher logs"
+    echo "  journalctl -t kiosk-ptt -f         # PTT logs"
+    echo "  sudo -u $t_user journalctl --user -u baresip -f  # Baresip logs"
     echo "---------------------------------------------------"
 }
 
@@ -1889,25 +1928,49 @@ create_baresip_launcher() {
     cat > /usr/local/bin/easy-asterisk-launcher << LAUNCHER
 #!/bin/bash
 CONFIG_FILE="/home/${launcher_user}/.baresip/config"
+ACCOUNTS_FILE="/home/${launcher_user}/.baresip/accounts"
 TARGETS=("8.8.8.8" "1.1.1.1" "9.9.9.9")
 FOUND_IFACE=""
 
+logger -t baresip-launcher "Starting Baresip launcher for user ${launcher_user}"
+
+# Wait for network
 for i in {1..6}; do
     for target in "\${TARGETS[@]}"; do
         IFACE=\$(ip route get "\$target" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i=="dev") print \$(i+1)}' | head -1)
         if [[ -n "\$IFACE" ]]; then
             FOUND_IFACE="\$IFACE"
+            logger -t baresip-launcher "Network found on interface: \$IFACE"
             break 2
         fi
     done
+    logger -t baresip-launcher "Waiting for network... (attempt \$i/6)"
     sleep 5
 done
 
+if [[ -z "\$FOUND_IFACE" ]]; then
+    logger -t baresip-launcher "ERROR: No network interface found after 30 seconds"
+fi
+
+# Update network interface in config
 if [[ -f "\$CONFIG_FILE" && -n "\$FOUND_IFACE" ]]; then
     sed -i '/^#*net_interface/d' "\$CONFIG_FILE"
     echo "net_interface \${FOUND_IFACE}" >> "\$CONFIG_FILE"
+    logger -t baresip-launcher "Updated config with interface: \$FOUND_IFACE"
 fi
 
+# Verify config files exist
+if [[ ! -f "\$CONFIG_FILE" ]]; then
+    logger -t baresip-launcher "ERROR: Config file not found: \$CONFIG_FILE"
+    exit 1
+fi
+
+if [[ ! -f "\$ACCOUNTS_FILE" ]]; then
+    logger -t baresip-launcher "ERROR: Accounts file not found: \$ACCOUNTS_FILE"
+    exit 1
+fi
+
+logger -t baresip-launcher "Starting Baresip client..."
 exec /usr/bin/baresip -f "/home/${launcher_user}/.baresip"
 LAUNCHER
     chmod +x /usr/local/bin/easy-asterisk-launcher
@@ -1928,13 +1991,18 @@ enable_client_services() {
 Description=Baresip SIP Client
 After=pipewire.service pipewire-pulse.service network-online.target
 Wants=network-online.target pipewire.service pipewire-pulse.service
+Requires=pipewire-pulse.service
 
 [Service]
 Type=simple
+ExecStartPre=/bin/sleep 5
 ExecStart=/usr/local/bin/easy-asterisk-launcher
 Restart=always
-RestartSec=5
+RestartSec=10
 Environment=XDG_RUNTIME_DIR=/run/user/${KIOSK_UID}
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${KIOSK_UID}/bus
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=default.target
@@ -1944,16 +2012,21 @@ EOF
     cat > "${systemd_dir}/kiosk-ptt.service" << EOF
 [Unit]
 Description=PTT Button Handler
-After=pipewire.service
+After=pipewire.service pipewire-pulse.service baresip.service
+Requires=pipewire-pulse.service
 ConditionPathExists=/etc/easy-asterisk/ptt-device
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sleep 3
+ExecStartPre=/bin/sleep 8
 ExecStart=/usr/local/bin/kiosk-ptt
 Restart=always
-RestartSec=5
+RestartSec=10
 Environment=XDG_RUNTIME_DIR=/run/user/${KIOSK_UID}
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${KIOSK_UID}/bus
+Environment=KIOSK_UID=${KIOSK_UID}
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=default.target
@@ -2512,16 +2585,56 @@ submenu_client() {
     [[ "$choice" != "0" ]] && submenu_client
 }
 
+fix_audio_manually() {
+    print_header "Manual Audio Fix"
+    load_config
+    local t_user="${KIOSK_USER:-$SUDO_USER}"
+    t_user="${t_user:-$USER}"
+    local t_uid=$(id -u "$t_user" 2>/dev/null)
+    local user_dbus="XDG_RUNTIME_DIR=/run/user/$t_uid"
+
+    echo "Fixing audio for user: $t_user"
+    echo ""
+
+    # Restart PipeWire services
+    echo "Restarting PipeWire services..."
+    sudo -u "$t_user" $user_dbus systemctl --user restart pipewire pipewire-pulse 2>/dev/null || true
+    sleep 2
+
+    # Unmute audio
+    echo "Unmuting audio sources and sinks..."
+    sudo -u "$t_user" $user_dbus pactl set-source-mute @DEFAULT_SOURCE@ 0 2>/dev/null && echo "  ✓ Microphone unmuted" || echo "  ✗ Failed to unmute microphone"
+    sudo -u "$t_user" $user_dbus pactl set-sink-mute @DEFAULT_SINK@ 0 2>/dev/null && echo "  ✓ Speaker unmuted" || echo "  ✗ Failed to unmute speaker"
+
+    # Set volume
+    echo "Setting volume levels to 75%..."
+    sudo -u "$t_user" $user_dbus pactl set-source-volume @DEFAULT_SOURCE@ 75% 2>/dev/null && echo "  ✓ Microphone volume set" || echo "  ✗ Failed to set microphone volume"
+    sudo -u "$t_user" $user_dbus pactl set-sink-volume @DEFAULT_SINK@ 75% 2>/dev/null && echo "  ✓ Speaker volume set" || echo "  ✗ Failed to set speaker volume"
+
+    echo ""
+    echo "Current audio status:"
+    local src_mute=$(sudo -u "$t_user" $user_dbus pactl get-source-mute @DEFAULT_SOURCE@ 2>/dev/null | awk '{print $2}')
+    local sink_mute=$(sudo -u "$t_user" $user_dbus pactl get-sink-mute @DEFAULT_SINK@ 2>/dev/null | awk '{print $2}')
+    echo "  Microphone: ${src_mute:-unknown}"
+    echo "  Speaker:    ${sink_mute:-unknown}"
+
+    echo ""
+    echo "Restarting Baresip..."
+    sudo -u "$t_user" $user_dbus systemctl --user restart baresip 2>/dev/null && echo "  ✓ Baresip restarted" || echo "  ✗ Failed to restart Baresip"
+}
+
 submenu_tools() {
     clear
     print_header "Tools"
     echo "  1) Audio Test"
     echo "  2) Verify Audio/Codec Setup"
+    echo "  3) Fix Audio (Unmute & Restart)"
     echo "  0) Back"
     read -p "  Select: " choice
     case $choice in
         1) run_audio_test ;;
         2) verify_audio_setup ;;
+        3) fix_audio_manually ;;
         0) return ;;
     esac
     [[ "$choice" != "0" ]] && read -p "Press Enter..."
