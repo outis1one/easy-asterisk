@@ -1570,19 +1570,75 @@ show_preflight_check() {
 
 test_sip_connectivity() {
     print_header "SIP Connectivity Test"
-    if systemctl is-active asterisk >/dev/null; then
-        print_success "Asterisk Running"
+
+    # 1. Asterisk Service Status
+    echo -e "${BOLD}1. Asterisk Service:${NC}"
+    if systemctl is-active asterisk >/dev/null 2>&1; then
+        echo -e "   ${GREEN}✓${NC} Running"
     else
-        print_error "Asterisk Down"
+        echo -e "   ${RED}✗${NC} NOT RUNNING!"
+        echo "   Fix: systemctl restart asterisk"
+        return
     fi
+
+    # 2. Port Listening Check
     echo ""
-    echo "Listening ports:"
-    ss -ulnp | grep 5060 || echo "  UDP 5060: Not listening"
-    ss -tlnp | grep 5061 || echo "  TCP 5061: Not listening"
+    echo -e "${BOLD}2. Listening Ports:${NC}"
+    if ss -ulnp 2>/dev/null | grep -q ":5060"; then
+        echo -e "   ${GREEN}✓${NC} UDP 5060: Listening"
+    else
+        echo -e "   ${RED}✗${NC} UDP 5060: NOT listening - This is the problem!"
+    fi
+    if ss -tlnp 2>/dev/null | grep -q ":5061"; then
+        echo "   TCP 5061: Listening"
+    fi
+
+    # 3. Endpoint Status
+    echo ""
+    echo -e "${BOLD}3. Endpoint Status:${NC}"
+    local endpoints=$(asterisk -rx "pjsip show endpoints" 2>/dev/null | grep -E "^  *[0-9]+" | awk '{print $1}')
+    if [[ -n "$endpoints" ]]; then
+        echo "$endpoints" | while read ext; do
+            local contact=$(asterisk -rx "pjsip show endpoint $ext" 2>/dev/null | grep "contact:" | awk '{print $2}')
+            if [[ -z "$contact" || "$contact" == "Not" ]]; then
+                echo -e "   ${RED}✗${NC} Ext $ext: Offline (not registered)"
+            else
+                echo -e "   ${GREEN}✓${NC} Ext $ext: Online - $contact"
+            fi
+        done
+    else
+        echo "   No endpoints found"
+    fi
+
+    # 4. Transport Configuration
+    echo ""
+    echo -e "${BOLD}4. PJSIP Transports:${NC}"
+    asterisk -rx "pjsip show transports" 2>/dev/null | grep -A1 "Transport:" | head -6
+
+    # 5. Recent Errors
+    echo ""
+    echo -e "${BOLD}5. Recent Errors:${NC}"
+    if [[ -f /var/log/asterisk/messages ]]; then
+        local errors=$(tail -30 /var/log/asterisk/messages | grep -i "error\|failed" | tail -3)
+        if [[ -n "$errors" ]]; then
+            echo "$errors"
+        else
+            echo "   No recent errors"
+        fi
+    fi
+
+    echo ""
+    echo "═══════════════════════════════════════════════════════════"
+    echo "Quick Fixes:"
+    echo "  • Restart Asterisk: systemctl restart asterisk"
+    echo "  • Watch live: asterisk -rvvv (then try phone registration)"
+    echo "  • Enable verbose: asterisk -rx 'core set verbose 5'"
+    echo "═══════════════════════════════════════════════════════════"
+
     if [[ -n "$DOMAIN_NAME" ]]; then
         echo ""
         echo "TLS Certificate check:"
-        timeout 5 openssl s_client -connect localhost:5061 -servername "$DOMAIN_NAME" 2>/dev/null | grep "Verify return code" || echo "  TLS test failed"
+        timeout 5 openssl s_client -connect localhost:5061 -servername "$DOMAIN_NAME" 2>/dev/null | grep "Verify return code" || echo "  TLS test failed or not configured"
     fi
 }
 
