@@ -683,6 +683,8 @@ EOF
     if [[ "$USE_COTURN" == "y" ]]; then
         echo "  TURN:      ${TURN_DOMAIN:-${DOMAIN_NAME:-$CURRENT_PUBLIC_IP}}:${DEFAULT_TURN_PORT}"
     fi
+    echo ""
+    echo "  Config: ENABLE_TLS=$ENABLE_TLS, DOMAIN_NAME=${DOMAIN_NAME:-<not set>}"
     echo "════════════════════════════════════════════════════════"
 }
 
@@ -2013,6 +2015,7 @@ install_full() {
     install_dependencies
     INSTALLED_SERVER="y"
     INSTALLED_CLIENT="y"
+    ENABLE_TLS="n"  # LAN-only by default, set to "y" only if internet/certs setup is run
     configure_asterisk
     configure_baresip
     enable_client_services
@@ -2036,7 +2039,7 @@ install_full() {
 install_server_only() {
     print_header "Server Installation"
     ASTERISK_HOST="127.0.0.1"
-    ENABLE_TLS="y"
+    ENABLE_TLS="n"  # LAN-only by default, set to "y" only if internet/certs setup is run
     install_asterisk_packages
     configure_asterisk
     open_firewall_ports
