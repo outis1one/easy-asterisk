@@ -1,8 +1,34 @@
 #!/bin/bash
 # ================================================================
-# Easy Asterisk - Interactive Installer v1.24
+# Easy Asterisk - Interactive Installer v1.25
 #
-# UPDATES in v1.24:
+# UPDATES in v1.25:
+# - QUICK LOCAL SETUP: New recommended installation path (90% use case)
+#   * One-click local network setup
+#   * PTT with mute-by-default
+#   * Auto-answer for kiosks
+#   * Audio ducking
+#   * No COTURN/internet/certificates needed
+#   * Perfect for intercoms, warehouses, offices
+#
+# - VPN DETECTION: Automatic VPN interface detection
+#   * Detects Tailscale, WireGuard, OpenVPN
+#   * Offers to bind Asterisk to VPN IP
+#   * Shows benefits of VPN vs COTURN
+#   * Stores VPN config (USE_VPN, VPN_INTERFACE, VPN_IP)
+#
+# - SIMPLIFIED COTURN GUIDANCE: Crystal-clear when you need it
+#   * Shows "Do you ACTUALLY need COTURN?" with examples
+#   * ✗ DON'T need: Local network, VPN, simple NAT
+#   * ✓ DO need: Symmetric NAT, VLAN isolation, corporate firewall
+#   * Changed default prompt from [Y/n] to [y/N] (opt-in not opt-out)
+#
+# - TURN DOMAIN: Defaults to SIP domain (same domain is fine!)
+#   * TURN_DOMAIN defaults to DOMAIN_NAME
+#   * Explains single vs separate domain options
+#   * Warns if using separate domains about cert coverage
+#
+# RETAINED from v1.24:
 # - COMPREHENSIVE: Complete OPNsense/pfSense VLAN configuration guide
 #   * Full network topology documentation (LAN + VLAN 20/30/40)
 #   * Step-by-step firewall rules for VLAN isolation
@@ -46,6 +72,12 @@
 # ================================================================
 
 set +e
+
+# Version and Update Info
+SCRIPT_VERSION="1.25"
+GITHUB_REPO="outis1one/asterisk-easy"
+SCRIPT_NAME="easy-asterisk-interactive-v1.25.sh"
+BACKUP_DIR="/etc/easy-asterisk/backups"
 
 # Colors
 RED='\033[0;31m'
@@ -102,6 +134,10 @@ load_config() {
     KIOSK_USER="${KIOSK_USER:-}"
     KIOSK_UID="${KIOSK_UID:-}"
     USE_COTURN="${USE_COTURN:-n}"
+    USE_VPN="${USE_VPN:-n}"
+    VPN_INTERFACE="${VPN_INTERFACE:-}"
+    VPN_IP="${VPN_IP:-}"
+    VPN_TYPE="${VPN_TYPE:-}"
     TURN_SECRET="${TURN_SECRET:-}"
     TURN_USER="${TURN_USER:-kioskuser}"
     TURN_PASS="${TURN_PASS:-}"
@@ -139,6 +175,10 @@ INSTALLED_SERVER="$INSTALLED_SERVER"
 INSTALLED_CLIENT="$INSTALLED_CLIENT"
 INSTALLED_COTURN="$INSTALLED_COTURN"
 USE_COTURN="$USE_COTURN"
+USE_VPN="$USE_VPN"
+VPN_INTERFACE="$VPN_INTERFACE"
+VPN_IP="$VPN_IP"
+VPN_TYPE="$VPN_TYPE"
 USE_GOOGLE_STUN="$USE_GOOGLE_STUN"
 IP_TYPE="$IP_TYPE"
 HAS_DYNAMIC_DNS="$HAS_DYNAMIC_DNS"
@@ -183,8 +223,117 @@ open_firewall_ports() {
 }
 
 # ================================================================
-# 2. COTURN SETUP & DYNAMIC IP
+# 2. VPN & NETWORK DETECTION
 # ================================================================
+
+detect_vpn_interface() {
+    print_header "VPN Detection"
+
+    # Check for common VPN interfaces
+    local vpn_interfaces=()
+    local vpn_ips=()
+    local vpn_types=()
+
+    # Tailscale
+    if ip link show tailscale0 &>/dev/null; then
+        local ts_ip=$(ip -4 addr show tailscale0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        if [[ -n "$ts_ip" ]]; then
+            vpn_interfaces+=("tailscale0")
+            vpn_ips+=("$ts_ip")
+            vpn_types+=("Tailscale")
+        fi
+    fi
+
+    # NetBird
+    if ip link show wt0 &>/dev/null; then
+        local nb_ip=$(ip -4 addr show wt0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        if [[ -n "$nb_ip" ]]; then
+            vpn_interfaces+=("wt0")
+            vpn_ips+=("$nb_ip")
+            vpn_types+=("NetBird")
+        fi
+    fi
+
+    # WireGuard
+    for wg_if in $(ip link show | grep -oP 'wg\d+|wireguard\d+' | sort -u); do
+        local wg_ip=$(ip -4 addr show "$wg_if" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        if [[ -n "$wg_ip" ]]; then
+            vpn_interfaces+=("$wg_if")
+            vpn_ips+=("$wg_ip")
+            vpn_types+=("WireGuard")
+        fi
+    done
+
+    # OpenVPN (tun/tap)
+    for tun_if in $(ip link show | grep -oP 'tun\d+|tap\d+' | sort -u); do
+        local tun_ip=$(ip -4 addr show "$tun_if" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        if [[ -n "$tun_ip" ]]; then
+            vpn_interfaces+=("$tun_if")
+            vpn_ips+=("$tun_ip")
+            vpn_types+=("OpenVPN")
+        fi
+    done
+
+    if [[ ${#vpn_interfaces[@]} -eq 0 ]]; then
+        echo "No VPN interfaces detected."
+        echo ""
+        echo "Supported VPNs: Tailscale, NetBird, WireGuard, OpenVPN"
+        echo ""
+        echo "Want to use VPN? Install one of the above, then re-run this script."
+        return 1
+    fi
+
+    echo "Detected VPN interface(s):"
+    for i in "${!vpn_interfaces[@]}"; do
+        echo "  $((i+1))) ${vpn_types[$i]}: ${vpn_interfaces[$i]} → ${vpn_ips[$i]}"
+    done
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  IMPORTANT: VPN Setup Requirements                        ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "For VPN to work, you must install it on:"
+    echo "  ${BOLD}1. This Asterisk server${NC} ${GREEN}✓${NC} (detected above)"
+    echo "  ${BOLD}2. ALL kiosk/client devices${NC}"
+    echo ""
+    echo "Benefits of using VPN:"
+    echo "  ${GREEN}✓${NC} No COTURN needed (simpler setup)"
+    echo "  ${GREEN}✓${NC} No port forwarding needed (more secure)"
+    echo "  ${GREEN}✓${NC} No public IP/DNS issues (works with dynamic IP)"
+    echo "  ${GREEN}✓${NC} Works across VLANs automatically"
+    echo "  ${GREEN}✓${NC} Internet users can still call in via FQDN"
+    echo ""
+    echo "How it works:"
+    echo "  • Clients register to Asterisk using VPN IP"
+    echo "  • Asterisk acts as a bridge between VPN and public internet"
+    echo "  • External callers use FQDN (port forward 5060/5061 + 10000-20000)"
+    echo ""
+    read -p "Use VPN interface for Asterisk? [Y/n]: " use_vpn
+
+    if [[ ! "$use_vpn" =~ ^[Nn]$ ]]; then
+        if [[ ${#vpn_interfaces[@]} -eq 1 ]]; then
+            VPN_INTERFACE="${vpn_interfaces[0]}"
+            VPN_IP="${vpn_ips[0]}"
+            VPN_TYPE="${vpn_types[0]}"
+        else
+            read -p "Select interface [1-${#vpn_interfaces[@]}]: " vpn_choice
+            vpn_choice=$((vpn_choice - 1))
+            VPN_INTERFACE="${vpn_interfaces[$vpn_choice]}"
+            VPN_IP="${vpn_ips[$vpn_choice]}"
+            VPN_TYPE="${vpn_types[$vpn_choice]}"
+        fi
+
+        ASTERISK_HOST="$VPN_IP"
+        USE_VPN="y"
+        print_success "VPN Mode: ${VPN_TYPE} ($VPN_INTERFACE → $VPN_IP)"
+        echo ""
+        print_warn "Remember: Install ${VPN_TYPE} on all kiosk devices!"
+        save_config
+        return 0
+    fi
+
+    return 1
+}
 
 get_public_ip() {
     local ip=$(curl -s -4 --connect-timeout 5 ifconfig.me 2>/dev/null || curl -s -4 --connect-timeout 5 icanhazip.com 2>/dev/null || echo "")
@@ -521,9 +670,27 @@ configure_coturn_menu() {
             5) uninstall_coturn ;;
         esac
     else
-        echo "COTURN is not installed."
-        read -p "Install now? [Y/n]: " install
-        if [[ ! "$install" =~ ^[Nn]$ ]]; then
+        echo "╔════════════════════════════════════════════════════════════╗"
+        echo "║             Do you ACTUALLY need COTURN?                  ║"
+        echo "╚════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "${RED}✗ You DON'T need COTURN if:${NC}"
+        echo "  • Local network only"
+        echo "  • Using VPN (Tailscale/WireGuard)"
+        echo "  • Server has public IP + simple port forwarding"
+        echo ""
+        echo "${GREEN}✓ You DO need COTURN if:${NC}"
+        echo "  • Symmetric NAT / strict firewall"
+        echo "  • VLAN isolation (like OPNsense example)"
+        echo "  • Corporate network with limited ports"
+        echo ""
+        echo "COTURN requires:"
+        echo "  • Domain name (FQDN)"
+        echo "  • Static IP OR Dynamic DNS"
+        echo "  • Port forwarding (3478, 49152-65535)"
+        echo ""
+        read -p "Install COTURN anyway? [y/N]: " install
+        if [[ "$install" =~ ^[Yy]$ ]]; then
             install_coturn
             if [[ "$INSTALLED_COTURN" == "y" ]]; then
                 create_ip_update_script
@@ -1150,8 +1317,91 @@ show_port_requirements() {
     echo "└──────────────────┴──────────┴───────────────────────────────┘"
     echo ""
     echo "NOTE: VPN Users"
-    echo "If ALL clients and server are on a VPN (Tailscale/Wireguard), you DO NOT"
+    echo "If ALL clients and server are on a VPN (Tailscale/NetBird/Wireguard), you DO NOT"
     echo "need port forwarding or COTURN. Just bind Asterisk to the VPN IP."
+    echo ""
+    echo "For detailed internet calling scenarios, see: Server Settings → Internet Calling Guide"
+}
+
+show_internet_calling_guide() {
+    print_header "Internet Calling Scenarios"
+
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  SCENARIO 1: Simple Internet Calling (No VPN)             ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Setup:"
+    echo "  • Asterisk server has public IP (or port forwarding)"
+    echo "  • FQDN points to public IP (e.g., sip.example.com)"
+    echo "  • Port forward: 5060/5061 (SIP) + 10000-20000 (RTP)"
+    echo "  • Clients on LAN or internet"
+    echo ""
+    echo "Works for:"
+    echo "  ${GREEN}✓${NC} Internet users calling in"
+    echo "  ${GREEN}✓${NC} LAN users calling each other"
+    echo "  ${GREEN}✓${NC} Simple NAT scenarios"
+    echo ""
+    echo "Limitations:"
+    echo "  ${RED}✗${NC} May not work with symmetric NAT"
+    echo "  ${RED}✗${NC} May not work with strict corporate firewalls"
+    echo "  ${RED}✗${NC} Requires COTURN for VLAN isolation"
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  SCENARIO 2: VPN + Internet Calling (BEST!)               ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Setup:"
+    echo "  • VPN installed on: Asterisk server + ALL kiosks"
+    echo "  • Asterisk listens on: VPN IP (e.g., 100.64.1.1)"
+    echo "  • FQDN points to public IP (sip.example.com)"
+    echo "  • Port forward: 5060/5061 + 10000-20000 (for internet callers)"
+    echo ""
+    echo "How it works:"
+    echo "  ${BOLD}Kiosks → Server:${NC}"
+    echo "    Kiosk registers to Asterisk via VPN IP (100.64.1.1)"
+    echo "    No port forwarding needed for kiosks"
+    echo "    Works even if kiosks are on different VLANs!"
+    echo ""
+    echo "  ${BOLD}Internet → Server → Kiosk:${NC}"
+    echo "    1. Internet user calls sip.example.com:5060"
+    echo "    2. Port forward routes to Asterisk (public interface)"
+    echo "    3. Asterisk routes call to kiosk via VPN network"
+    echo "    4. Kiosk receives call (even if on VLAN 20!)"
+    echo ""
+    echo "Benefits:"
+    echo "  ${GREEN}✓${NC} No COTURN needed"
+    echo "  ${GREEN}✓${NC} Works across VLANs automatically"
+    echo "  ${GREEN}✓${NC} Kiosks don't need port forwarding"
+    echo "  ${GREEN}✓${NC} Internet users can still call in"
+    echo "  ${GREEN}✓${NC} More secure (VPN encrypted)"
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  SCENARIO 3: COTURN + VLAN Isolation                      ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Setup:"
+    echo "  • OPNsense/pfSense router with VLAN isolation"
+    echo "  • COTURN on LAN (e.g., 192.168.1.50)"
+    echo "  • Kiosks on isolated VLANs (192.168.2.x, 192.168.3.x, etc.)"
+    echo "  • Firewall allows: VLAN → COTURN ports"
+    echo "  • Firewall blocks: VLAN → VLAN direct communication"
+    echo ""
+    echo "How it works:"
+    echo "  Kiosk A (VLAN 20) ↔ COTURN ↔ Kiosk B (VLAN 30)"
+    echo "  VLANs communicate through COTURN relay"
+    echo ""
+    echo "When to use:"
+    echo "  ${YELLOW}⚠${NC} Only if you can't use VPN"
+    echo "  ${YELLOW}⚠${NC} Only if you need strict VLAN isolation"
+    echo "  ${YELLOW}⚠${NC} Requires: FQDN, static IP or DDNS, complex firewall rules"
+    echo ""
+    echo "${CYAN}Recommendation: Use VPN instead - it's simpler and more reliable!${NC}"
+    echo ""
+    read -p "Press Enter to return..."
 }
 
 show_firewall_guide() {
@@ -2183,9 +2433,18 @@ setup_internet_access() {
     ASTERISK_HOST="$DOMAIN_NAME"
     
     echo ""
-    echo "Do you have a separate domain for TURN? (e.g., turn.example.com)"
-    read -p "Enter TURN domain (leave empty to use $DOMAIN_NAME): " t_dom
+    echo "TURN domain (for COTURN server):"
+    echo "  → Press Enter to use same domain: ${DOMAIN_NAME}"
+    echo "  → Or enter separate domain (e.g., turn.example.com)"
+    read -p "TURN domain [$DOMAIN_NAME]: " t_dom
     TURN_DOMAIN="${t_dom:-$DOMAIN_NAME}"
+
+    if [[ "$TURN_DOMAIN" == "$DOMAIN_NAME" ]]; then
+        print_info "Using single domain for both SIP and TURN: $DOMAIN_NAME"
+    else
+        print_info "Separate domains: SIP=$DOMAIN_NAME, TURN=$TURN_DOMAIN"
+        print_warn "Make sure your certificate covers BOTH domains!"
+    fi
     
     # CIDR Prompt
     echo ""
@@ -2299,8 +2558,304 @@ setup_internet_access() {
 }
 
 # ================================================================
+# 9A. UPDATE SYSTEM
+# ================================================================
+
+check_for_updates() {
+    print_header "Check for Updates"
+
+    echo "Current Version: ${BOLD}v${SCRIPT_VERSION}${NC}"
+    echo ""
+    echo "Checking GitHub for latest release..."
+    echo ""
+
+    # Fetch latest release from GitHub
+    local latest_info=$(curl -s "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null)
+
+    if [[ -z "$latest_info" ]] || echo "$latest_info" | grep -q "API rate limit"; then
+        print_warn "Unable to check for updates (GitHub API unavailable or rate limited)"
+        echo ""
+        echo "You can manually check: https://github.com/${GITHUB_REPO}/releases"
+        return 1
+    fi
+
+    # Parse version and download URL
+    local latest_version=$(echo "$latest_info" | grep -oP '"tag_name":\s*"v?\K[0-9]+\.[0-9]+')
+    local release_url=$(echo "$latest_info" | grep -oP '"html_url":\s*"\K[^"]+' | head -1)
+    local download_url=$(echo "$latest_info" | grep -oP '"browser_download_url":\s*"\K[^"]+' | grep "\.sh$" | head -1)
+
+    if [[ -z "$latest_version" ]]; then
+        print_warn "Could not determine latest version"
+        return 1
+    fi
+
+    echo "Latest Version:  ${BOLD}v${latest_version}${NC}"
+    echo ""
+
+    # Compare versions
+    if [[ "$SCRIPT_VERSION" == "$latest_version" ]]; then
+        print_success "You are running the latest version!"
+        return 0
+    fi
+
+    # Version comparison (simple numeric)
+    local current_num=$(echo "$SCRIPT_VERSION" | tr -d '.')
+    local latest_num=$(echo "$latest_version" | tr -d '.')
+
+    if [[ "$current_num" -gt "$latest_num" ]]; then
+        print_info "You are running a NEWER version (development/testing)"
+        return 0
+    fi
+
+    # Update available
+    print_warn "Update available: v${SCRIPT_VERSION} → v${latest_version}"
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  ${YELLOW}⚠  IMPORTANT: Read About Breaking Changes${NC}              ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Before updating, please review the changelog:"
+    echo "  ${CYAN}${release_url}${NC}"
+    echo ""
+    echo "Breaking changes, new features, and migration notes are documented there."
+    echo ""
+    read -p "Continue with update? [y/N]: " do_update
+
+    if [[ "$do_update" =~ ^[Yy]$ ]]; then
+        perform_update "$latest_version" "$download_url" "$release_url"
+    else
+        print_info "Update cancelled"
+    fi
+}
+
+perform_update() {
+    local new_version=$1
+    local download_url=$2
+    local release_url=$3
+
+    print_header "Updating to v${new_version}"
+
+    # Create backup directory
+    mkdir -p "$BACKUP_DIR"
+    local backup_timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_file="${BACKUP_DIR}/easy-asterisk-v${SCRIPT_VERSION}_${backup_timestamp}.sh"
+
+    # Backup current script
+    echo "Creating backup..."
+    local script_path=$(readlink -f "$0")
+    cp "$script_path" "$backup_file"
+
+    if [[ ! -f "$backup_file" ]]; then
+        print_error "Failed to create backup!"
+        return 1
+    fi
+
+    print_success "Backup created: $backup_file"
+    echo ""
+
+    # Backup configuration
+    if [[ -d "$CONFIG_DIR" ]]; then
+        local config_backup="${BACKUP_DIR}/config_${backup_timestamp}.tar.gz"
+        tar -czf "$config_backup" -C "$CONFIG_DIR" . 2>/dev/null
+        print_success "Config backup: $config_backup"
+    fi
+
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  Rollback Instructions (if needed)                         ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "If the new version has issues, restore the backup:"
+    echo "  ${CYAN}cp $backup_file $script_path${NC}"
+    echo ""
+    echo "To restore config:"
+    echo "  ${CYAN}tar -xzf ${BACKUP_DIR}/config_${backup_timestamp}.tar.gz -C $CONFIG_DIR${NC}"
+    echo ""
+    read -p "Press Enter to continue with update..."
+
+    # Download new version
+    echo ""
+    echo "Downloading v${new_version}..."
+
+    if [[ -n "$download_url" ]]; then
+        # Download from release asset
+        local temp_file="/tmp/easy-asterisk-update-${new_version}.sh"
+        if curl -fsSL "$download_url" -o "$temp_file"; then
+            chmod +x "$temp_file"
+            cp "$temp_file" "$script_path"
+            rm -f "$temp_file"
+            print_success "Update downloaded and installed!"
+        else
+            print_error "Download failed!"
+            echo "Manual update: Download from ${release_url}"
+            return 1
+        fi
+    else
+        # Fallback: clone repo and copy script
+        print_warn "Direct download not available, using git clone method..."
+        local temp_dir="/tmp/easy-asterisk-update-$$"
+        if git clone --depth 1 "https://github.com/${GITHUB_REPO}.git" "$temp_dir" 2>/dev/null; then
+            local new_script=$(find "$temp_dir" -name "easy-asterisk-interactive-v${new_version}.sh" -o -name "easy-asterisk-interactive-v*.sh" | sort -V | tail -1)
+            if [[ -f "$new_script" ]]; then
+                chmod +x "$new_script"
+                cp "$new_script" "$script_path"
+                rm -rf "$temp_dir"
+                print_success "Update installed via git!"
+            else
+                print_error "Could not find script in repository"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+        else
+            print_error "Git clone failed!"
+            echo "Manual update: Download from ${release_url}"
+            return 1
+        fi
+    fi
+
+    echo ""
+    print_success "Update complete: v${SCRIPT_VERSION} → v${new_version}"
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+    echo "${BOLD}What's Next:${NC}"
+    echo "  1. Review changelog: ${release_url}"
+    echo "  2. Restart services if needed (offered below)"
+    echo "  3. Test your configuration"
+    echo ""
+
+    # Offer to restart services
+    if systemctl is-active asterisk >/dev/null 2>&1 || systemctl is-active baresip >/dev/null 2>&1; then
+        read -p "Restart Asterisk and Baresip services now? [Y/n]: " restart_services
+        if [[ ! "$restart_services" =~ ^[Nn]$ ]]; then
+            restart_all_services
+        fi
+    fi
+
+    echo ""
+    print_warn "Script has been updated. Please re-run it to use the new version:"
+    echo "  ${CYAN}sudo $script_path${NC}"
+    echo ""
+    read -p "Press Enter to exit..."
+    exit 0
+}
+
+restart_all_services() {
+    print_header "Restarting Services"
+
+    # Restart Asterisk
+    if systemctl is-active asterisk >/dev/null 2>&1; then
+        echo "Restarting Asterisk..."
+        systemctl restart asterisk
+        if systemctl is-active asterisk >/dev/null 2>&1; then
+            print_success "Asterisk restarted"
+        else
+            print_error "Asterisk failed to restart"
+            echo "Check logs: journalctl -u asterisk -n 50"
+        fi
+    fi
+
+    # Restart Baresip (user service)
+    if [[ -n "$KIOSK_USER" && -n "$KIOSK_UID" ]]; then
+        local user_dbus="XDG_RUNTIME_DIR=/run/user/${KIOSK_UID}"
+        if sudo -u "$KIOSK_USER" $user_dbus systemctl --user is-active baresip >/dev/null 2>&1; then
+            echo "Restarting Baresip..."
+            sudo -u "$KIOSK_USER" $user_dbus systemctl --user restart baresip kiosk-ptt 2>/dev/null
+            sleep 2
+            if sudo -u "$KIOSK_USER" $user_dbus systemctl --user is-active baresip >/dev/null 2>&1; then
+                print_success "Baresip restarted"
+            else
+                print_error "Baresip failed to restart"
+                echo "Check logs: sudo -u $KIOSK_USER journalctl --user -u baresip -n 50"
+            fi
+        fi
+    fi
+
+    # Restart COTURN
+    if systemctl is-active coturn >/dev/null 2>&1; then
+        echo "Restarting COTURN..."
+        systemctl restart coturn
+        if systemctl is-active coturn >/dev/null 2>&1; then
+            print_success "COTURN restarted"
+        else
+            print_error "COTURN failed to restart"
+        fi
+    fi
+}
+
+# ================================================================
 # 10. INSTALLATION
 # ================================================================
+
+install_quick_local() {
+    print_header "Quick Local Network Setup"
+
+    echo "This is the recommended setup for 90% of users:"
+    echo "  ${GREEN}✓${NC} Local network only (no internet)"
+    echo "  ${GREEN}✓${NC} PTT (push-to-talk) with mute-by-default"
+    echo "  ${GREEN}✓${NC} Auto-answer for kiosks"
+    echo "  ${GREEN}✓${NC} Audio ducking"
+    echo "  ${GREEN}✓${NC} No COTURN/certificates needed"
+    echo ""
+    echo "Perfect for:"
+    echo "  • Intercom systems"
+    echo "  • Warehouse communication"
+    echo "  • Office quick-call systems"
+    echo "  • Security/monitoring stations"
+    echo ""
+    read -p "Continue with quick setup? [Y/n]: " confirm
+    [[ "$confirm" =~ ^[Nn]$ ]] && return
+
+    # Check for VPN first
+    detect_vpn_interface || true
+
+    # Get client user
+    local default_user="${SUDO_USER:-$USER}"
+    read -p "Client User [$default_user]: " target_user
+    KIOSK_USER="${target_user:-$default_user}"
+    KIOSK_UID=$(id -u "$KIOSK_USER")
+
+    # Simple config
+    if [[ "$USE_VPN" == "y" ]]; then
+        ASTERISK_HOST="$VPN_IP"
+    else
+        ASTERISK_HOST=$(hostname -I | cut -d' ' -f1)
+    fi
+
+    SIP_PASSWORD=$(generate_password)
+    ENABLE_TLS="n"
+    CLIENT_ANSWERMODE="auto"
+    USE_COTURN="n"
+    USE_GOOGLE_STUN="n"
+
+    # Install
+    install_dependencies
+    INSTALLED_SERVER="y"
+    INSTALLED_CLIENT="y"
+    configure_asterisk
+    configure_baresip
+    enable_client_services
+    open_firewall_ports
+
+    # Configure PTT
+    echo ""
+    read -p "Configure PTT button now? [Y/n]: " do_ptt
+    if [[ ! "$do_ptt" =~ ^[Nn]$ ]]; then
+        detect_ptt_button
+    fi
+
+    save_config
+
+    print_success "Quick setup complete!"
+    echo ""
+    echo "═══════════════════════════════════════════════════════════"
+    echo "Your Asterisk server is running on: ${BOLD}$ASTERISK_HOST${NC}"
+    echo "  Extension: 101"
+    echo "  Password:  $SIP_PASSWORD"
+    echo ""
+    echo "Add more devices: Main Menu → Device Management → Add device"
+    echo "═══════════════════════════════════════════════════════════"
+}
 
 install_full() {
     print_header "Full Installation"
@@ -2308,7 +2863,10 @@ install_full() {
     read -p "Client User [$default_user]: " target_user
     KIOSK_USER="${target_user:-$default_user}"
     KIOSK_UID=$(id -u "$KIOSK_USER")
-    
+
+    # Check for VPN
+    detect_vpn_interface || true
+
     if ! collect_common_config; then return; fi
     collect_client_config
     install_dependencies
@@ -2319,11 +2877,18 @@ install_full() {
     enable_client_services
     open_firewall_ports
     save_config
-    
+
+    # Configure PTT for client
+    echo ""
+    read -p "Configure PTT button now? [Y/n]: " do_ptt
+    if [[ ! "$do_ptt" =~ ^[Nn]$ ]]; then
+        detect_ptt_button
+    fi
+
     echo ""
     read -p "Run Internet/Certificate Setup wizard now? [Y/n]: " run_setup
     [[ ! "$run_setup" =~ ^[Nn]$ ]] && setup_internet_access
-    
+
     print_success "Installation complete"
 }
 
@@ -2377,6 +2942,14 @@ install_client_only() {
     INSTALLED_CLIENT="y"
     configure_baresip
     enable_client_services
+
+    # Configure PTT
+    echo ""
+    read -p "Configure PTT button now? [Y/n]: " do_ptt
+    if [[ ! "$do_ptt" =~ ^[Nn]$ ]]; then
+        detect_ptt_button
+    fi
+
     save_config
     print_success "Client installed"
 }
@@ -2460,7 +3033,7 @@ uninstall_menu() {
 
 show_main_menu() {
     clear
-    print_header "Easy Asterisk v1.23"
+    print_header "Easy Asterisk v1.25"
     
     load_config
     echo "  Status:"
@@ -2497,17 +3070,22 @@ show_main_menu() {
 submenu_install() {
     clear
     print_header "Install"
-    echo "  1) Full (server + client)"
-    echo "  2) Server only"
-    echo "  3) Client only"
-    echo "  4) Uninstall"
+    echo "  ${BOLD}1) Quick Local Setup (Recommended)${NC}"
+    echo "     └─ Local network, PTT, auto-answer - No internet needed"
+    echo ""
+    echo "  ${CYAN}Advanced Options:${NC}"
+    echo "  2) Full (server + client with internet setup)"
+    echo "  3) Server only"
+    echo "  4) Client only"
+    echo "  5) Uninstall"
     echo "  0) Back"
     read -p "  Select: " choice
     case $choice in
-        1) install_full; read -p "Press Enter..." ;;
-        2) install_server_only; read -p "Press Enter..." ;;
-        3) install_client_only; read -p "Press Enter..." ;;
-        4) uninstall_menu; read -p "Press Enter..." ;;
+        1) install_quick_local; read -p "Press Enter..." ;;
+        2) install_full; read -p "Press Enter..." ;;
+        3) install_server_only; read -p "Press Enter..." ;;
+        4) install_client_only; read -p "Press Enter..." ;;
+        5) uninstall_menu; read -p "Press Enter..." ;;
     esac
 }
 
@@ -2517,24 +3095,26 @@ submenu_server() {
     echo "  1) Setup Internet Access (TLS/Certs/NAT)"
     echo "  2) Force re-sync Caddy certs"
     echo "  3) Show port/firewall requirements"
-    echo "  4) Interactive Firewall Guide (OPNsense/pfSense)"
-    echo "  5) Test SIP connectivity"
-    echo "  6) Verify CIDR/NAT config"
-    echo "  7) Watch Live Logs"
-    echo "  8) Router Doctor"
-    echo "  9) Configure TURN Server (COTURN)"
+    echo "  4) Internet Calling Guide (VPN/FQDN/COTURN scenarios)"
+    echo "  5) Interactive Firewall Guide (OPNsense/pfSense)"
+    echo "  6) Test SIP connectivity"
+    echo "  7) Verify CIDR/NAT config"
+    echo "  8) Watch Live Logs"
+    echo "  9) Router Doctor"
+    echo " 10) Configure TURN Server (COTURN)"
     echo "  0) Back"
     read -p "  Select: " choice
     case $choice in
         1) setup_internet_access ;;
         2) setup_caddy_cert_sync "force" ;;
         3) show_port_requirements ;;
-        4) show_firewall_guide ;;
-        5) test_sip_connectivity ;;
-        6) verify_cidr_config ;;
-        7) watch_live_logs ;;
-        8) router_doctor ;;
-        9) configure_coturn_menu ;;
+        4) show_internet_calling_guide ;;
+        5) show_firewall_guide ;;
+        6) test_sip_connectivity ;;
+        7) verify_cidr_config ;;
+        8) watch_live_logs ;;
+        9) router_doctor ;;
+        10) configure_coturn_menu ;;
         0) return ;;
     esac
     [[ "$choice" != "0" ]] && read -p "Press Enter..."
@@ -2586,11 +3166,13 @@ submenu_tools() {
     print_header "Tools"
     echo "  1) Audio Test"
     echo "  2) Verify Audio/Codec Setup"
+    echo "  3) Check for Updates"
     echo "  0) Back"
     read -p "  Select: " choice
     case $choice in
         1) run_audio_test ;;
         2) verify_audio_setup ;;
+        3) check_for_updates ;;
         0) return ;;
     esac
     [[ "$choice" != "0" ]] && read -p "Press Enter..."
