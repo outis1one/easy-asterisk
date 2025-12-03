@@ -1,32 +1,37 @@
 #!/bin/bash
 # ================================================================
-# Easy Asterisk - Interactive Installer v1.25
+# Easy Asterisk - Interactive Installer v1.27
 #
-# UPDATES in v1.25:
-# - QUICK LOCAL SETUP: New recommended installation path (90% use case)
-#   * One-click local network setup
-#   * PTT with mute-by-default
-#   * Auto-answer for kiosks
-#   * Audio ducking
-#   * No COTURN/internet/certificates needed
-#   * Perfect for intercoms, warehouses, offices
+# UPDATES in v1.27:
+# - FIXED COLOR RENDERING: All escape codes now display properly
+#   * Added -e flag to all echo statements with color codes
+#   * No more garbled \033[0;32m text showing
+#   * VPN detection, IP type, COTURN guidance all render correctly
 #
-# - VPN DETECTION: Automatic VPN interface detection
-#   * Detects Tailscale, WireGuard, OpenVPN
-#   * Offers to bind Asterisk to VPN IP
-#   * Shows benefits of VPN vs COTURN
-#   * Stores VPN config (USE_VPN, VPN_INTERFACE, VPN_IP)
+# - FIXED UNINSTALL HANG: "Remove Everything" works for server-only
+#   * Properly stops user services (baresip, kiosk-ptt) before removal
+#   * Handles missing KIOSK_USER/KIOSK_UID gracefully
+#   * Also removes COTURN and runs apt autoremove
+#   * No longer hangs when only server is installed
 #
-# - SIMPLIFIED COTURN GUIDANCE: Crystal-clear when you need it
-#   * Shows "Do you ACTUALLY need COTURN?" with examples
-#   * ✗ DON'T need: Local network, VPN, simple NAT
-#   * ✓ DO need: Symmetric NAT, VLAN isolation, corporate firewall
-#   * Changed default prompt from [Y/n] to [y/N] (opt-in not opt-out)
+# - QUICK SETUP OPTIONS: Combined or Server-only mode
+#   * Option 1: Server + Client (default - this machine hosts and uses Asterisk)
+#   * Option 2: Server Only (dedicated server - no client software/PTT)
+#   * Server-only skips client user, baresip, and PTT configuration
 #
-# - TURN DOMAIN: Defaults to SIP domain (same domain is fine!)
-#   * TURN_DOMAIN defaults to DOMAIN_NAME
-#   * Explains single vs separate domain options
-#   * Warns if using separate domains about cert coverage
+# - COTURN EXPLICITLY OPTIONAL: Clear separation in installation flow
+#   * Full Setup asks: "Setup internet access with FQDN/certs? [y/N]"
+#   * Then asks: "Setup COTURN server? [y/N]" (only if internet setup chosen)
+#   * Shows warning: "⚠ COTURN is complex and usually NOT needed!"
+#   * Defaults to NO (safer for users, VPN recommended instead)
+#
+# - AUTOMATIC UPDATE SYSTEM: GitHub integration with safe rollback
+#   * Check for updates from Tools menu
+#   * Shows current vs latest version
+#   * Displays breaking changes warning with changelog link
+#   * Creates timestamped backups before updating
+#   * Shows clear rollback instructions
+#   * Offers to restart Asterisk, Baresip, COTURN after update
 #
 # RETAINED from v1.24:
 # - COMPREHENSIVE: Complete OPNsense/pfSense VLAN configuration guide
