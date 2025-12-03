@@ -131,6 +131,7 @@ load_config() {
     USE_VPN="${USE_VPN:-n}"
     VPN_INTERFACE="${VPN_INTERFACE:-}"
     VPN_IP="${VPN_IP:-}"
+    VPN_TYPE="${VPN_TYPE:-}"
     TURN_SECRET="${TURN_SECRET:-}"
     TURN_USER="${TURN_USER:-kioskuser}"
     TURN_PASS="${TURN_PASS:-}"
@@ -171,6 +172,7 @@ USE_COTURN="$USE_COTURN"
 USE_VPN="$USE_VPN"
 VPN_INTERFACE="$VPN_INTERFACE"
 VPN_IP="$VPN_IP"
+VPN_TYPE="$VPN_TYPE"
 USE_GOOGLE_STUN="$USE_GOOGLE_STUN"
 IP_TYPE="$IP_TYPE"
 HAS_DYNAMIC_DNS="$HAS_DYNAMIC_DNS"
@@ -224,6 +226,7 @@ detect_vpn_interface() {
     # Check for common VPN interfaces
     local vpn_interfaces=()
     local vpn_ips=()
+    local vpn_types=()
 
     # Tailscale
     if ip link show tailscale0 &>/dev/null; then
@@ -231,6 +234,17 @@ detect_vpn_interface() {
         if [[ -n "$ts_ip" ]]; then
             vpn_interfaces+=("tailscale0")
             vpn_ips+=("$ts_ip")
+            vpn_types+=("Tailscale")
+        fi
+    fi
+
+    # NetBird
+    if ip link show wt0 &>/dev/null; then
+        local nb_ip=$(ip -4 addr show wt0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        if [[ -n "$nb_ip" ]]; then
+            vpn_interfaces+=("wt0")
+            vpn_ips+=("$nb_ip")
+            vpn_types+=("NetBird")
         fi
     fi
 
@@ -240,6 +254,7 @@ detect_vpn_interface() {
         if [[ -n "$wg_ip" ]]; then
             vpn_interfaces+=("$wg_if")
             vpn_ips+=("$wg_ip")
+            vpn_types+=("WireGuard")
         fi
     done
 
@@ -249,24 +264,43 @@ detect_vpn_interface() {
         if [[ -n "$tun_ip" ]]; then
             vpn_interfaces+=("$tun_if")
             vpn_ips+=("$tun_ip")
+            vpn_types+=("OpenVPN")
         fi
     done
 
     if [[ ${#vpn_interfaces[@]} -eq 0 ]]; then
         echo "No VPN interfaces detected."
+        echo ""
+        echo "Supported VPNs: Tailscale, NetBird, WireGuard, OpenVPN"
+        echo ""
+        echo "Want to use VPN? Install one of the above, then re-run this script."
         return 1
     fi
 
     echo "Detected VPN interface(s):"
     for i in "${!vpn_interfaces[@]}"; do
-        echo "  $((i+1))) ${vpn_interfaces[$i]} → ${vpn_ips[$i]}"
+        echo "  $((i+1))) ${vpn_types[$i]}: ${vpn_interfaces[$i]} → ${vpn_ips[$i]}"
     done
     echo ""
-    echo "Using a VPN simplifies your setup:"
-    echo "  ${GREEN}✓${NC} No COTURN needed"
-    echo "  ${GREEN}✓${NC} No port forwarding needed"
-    echo "  ${GREEN}✓${NC} No public IP/DNS issues"
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  IMPORTANT: VPN Setup Requirements                        ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "For VPN to work, you must install it on:"
+    echo "  ${BOLD}1. This Asterisk server${NC} ${GREEN}✓${NC} (detected above)"
+    echo "  ${BOLD}2. ALL kiosk/client devices${NC}"
+    echo ""
+    echo "Benefits of using VPN:"
+    echo "  ${GREEN}✓${NC} No COTURN needed (simpler setup)"
+    echo "  ${GREEN}✓${NC} No port forwarding needed (more secure)"
+    echo "  ${GREEN}✓${NC} No public IP/DNS issues (works with dynamic IP)"
     echo "  ${GREEN}✓${NC} Works across VLANs automatically"
+    echo "  ${GREEN}✓${NC} Internet users can still call in via FQDN"
+    echo ""
+    echo "How it works:"
+    echo "  • Clients register to Asterisk using VPN IP"
+    echo "  • Asterisk acts as a bridge between VPN and public internet"
+    echo "  • External callers use FQDN (port forward 5060/5061 + 10000-20000)"
     echo ""
     read -p "Use VPN interface for Asterisk? [Y/n]: " use_vpn
 
@@ -274,16 +308,20 @@ detect_vpn_interface() {
         if [[ ${#vpn_interfaces[@]} -eq 1 ]]; then
             VPN_INTERFACE="${vpn_interfaces[0]}"
             VPN_IP="${vpn_ips[0]}"
+            VPN_TYPE="${vpn_types[0]}"
         else
             read -p "Select interface [1-${#vpn_interfaces[@]}]: " vpn_choice
             vpn_choice=$((vpn_choice - 1))
             VPN_INTERFACE="${vpn_interfaces[$vpn_choice]}"
             VPN_IP="${vpn_ips[$vpn_choice]}"
+            VPN_TYPE="${vpn_types[$vpn_choice]}"
         fi
 
         ASTERISK_HOST="$VPN_IP"
         USE_VPN="y"
-        print_success "VPN Mode: Asterisk will bind to $VPN_INTERFACE ($VPN_IP)"
+        print_success "VPN Mode: ${VPN_TYPE} ($VPN_INTERFACE → $VPN_IP)"
+        echo ""
+        print_warn "Remember: Install ${VPN_TYPE} on all kiosk devices!"
         save_config
         return 0
     fi
@@ -1273,8 +1311,91 @@ show_port_requirements() {
     echo "└──────────────────┴──────────┴───────────────────────────────┘"
     echo ""
     echo "NOTE: VPN Users"
-    echo "If ALL clients and server are on a VPN (Tailscale/Wireguard), you DO NOT"
+    echo "If ALL clients and server are on a VPN (Tailscale/NetBird/Wireguard), you DO NOT"
     echo "need port forwarding or COTURN. Just bind Asterisk to the VPN IP."
+    echo ""
+    echo "For detailed internet calling scenarios, see: Server Settings → Internet Calling Guide"
+}
+
+show_internet_calling_guide() {
+    print_header "Internet Calling Scenarios"
+
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  SCENARIO 1: Simple Internet Calling (No VPN)             ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Setup:"
+    echo "  • Asterisk server has public IP (or port forwarding)"
+    echo "  • FQDN points to public IP (e.g., sip.example.com)"
+    echo "  • Port forward: 5060/5061 (SIP) + 10000-20000 (RTP)"
+    echo "  • Clients on LAN or internet"
+    echo ""
+    echo "Works for:"
+    echo "  ${GREEN}✓${NC} Internet users calling in"
+    echo "  ${GREEN}✓${NC} LAN users calling each other"
+    echo "  ${GREEN}✓${NC} Simple NAT scenarios"
+    echo ""
+    echo "Limitations:"
+    echo "  ${RED}✗${NC} May not work with symmetric NAT"
+    echo "  ${RED}✗${NC} May not work with strict corporate firewalls"
+    echo "  ${RED}✗${NC} Requires COTURN for VLAN isolation"
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  SCENARIO 2: VPN + Internet Calling (BEST!)               ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Setup:"
+    echo "  • VPN installed on: Asterisk server + ALL kiosks"
+    echo "  • Asterisk listens on: VPN IP (e.g., 100.64.1.1)"
+    echo "  • FQDN points to public IP (sip.example.com)"
+    echo "  • Port forward: 5060/5061 + 10000-20000 (for internet callers)"
+    echo ""
+    echo "How it works:"
+    echo "  ${BOLD}Kiosks → Server:${NC}"
+    echo "    Kiosk registers to Asterisk via VPN IP (100.64.1.1)"
+    echo "    No port forwarding needed for kiosks"
+    echo "    Works even if kiosks are on different VLANs!"
+    echo ""
+    echo "  ${BOLD}Internet → Server → Kiosk:${NC}"
+    echo "    1. Internet user calls sip.example.com:5060"
+    echo "    2. Port forward routes to Asterisk (public interface)"
+    echo "    3. Asterisk routes call to kiosk via VPN network"
+    echo "    4. Kiosk receives call (even if on VLAN 20!)"
+    echo ""
+    echo "Benefits:"
+    echo "  ${GREEN}✓${NC} No COTURN needed"
+    echo "  ${GREEN}✓${NC} Works across VLANs automatically"
+    echo "  ${GREEN}✓${NC} Kiosks don't need port forwarding"
+    echo "  ${GREEN}✓${NC} Internet users can still call in"
+    echo "  ${GREEN}✓${NC} More secure (VPN encrypted)"
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  SCENARIO 3: COTURN + VLAN Isolation                      ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Setup:"
+    echo "  • OPNsense/pfSense router with VLAN isolation"
+    echo "  • COTURN on LAN (e.g., 192.168.1.50)"
+    echo "  • Kiosks on isolated VLANs (192.168.2.x, 192.168.3.x, etc.)"
+    echo "  • Firewall allows: VLAN → COTURN ports"
+    echo "  • Firewall blocks: VLAN → VLAN direct communication"
+    echo ""
+    echo "How it works:"
+    echo "  Kiosk A (VLAN 20) ↔ COTURN ↔ Kiosk B (VLAN 30)"
+    echo "  VLANs communicate through COTURN relay"
+    echo ""
+    echo "When to use:"
+    echo "  ${YELLOW}⚠${NC} Only if you can't use VPN"
+    echo "  ${YELLOW}⚠${NC} Only if you need strict VLAN isolation"
+    echo "  ${YELLOW}⚠${NC} Requires: FQDN, static IP or DDNS, complex firewall rules"
+    echo ""
+    echo "${CYAN}Recommendation: Use VPN instead - it's simpler and more reliable!${NC}"
+    echo ""
+    read -p "Press Enter to return..."
 }
 
 show_firewall_guide() {
@@ -2525,6 +2646,13 @@ install_full() {
     open_firewall_ports
     save_config
 
+    # Configure PTT for client
+    echo ""
+    read -p "Configure PTT button now? [Y/n]: " do_ptt
+    if [[ ! "$do_ptt" =~ ^[Nn]$ ]]; then
+        detect_ptt_button
+    fi
+
     echo ""
     read -p "Run Internet/Certificate Setup wizard now? [Y/n]: " run_setup
     [[ ! "$run_setup" =~ ^[Nn]$ ]] && setup_internet_access
@@ -2582,6 +2710,14 @@ install_client_only() {
     INSTALLED_CLIENT="y"
     configure_baresip
     enable_client_services
+
+    # Configure PTT
+    echo ""
+    read -p "Configure PTT button now? [Y/n]: " do_ptt
+    if [[ ! "$do_ptt" =~ ^[Nn]$ ]]; then
+        detect_ptt_button
+    fi
+
     save_config
     print_success "Client installed"
 }
@@ -2727,24 +2863,26 @@ submenu_server() {
     echo "  1) Setup Internet Access (TLS/Certs/NAT)"
     echo "  2) Force re-sync Caddy certs"
     echo "  3) Show port/firewall requirements"
-    echo "  4) Interactive Firewall Guide (OPNsense/pfSense)"
-    echo "  5) Test SIP connectivity"
-    echo "  6) Verify CIDR/NAT config"
-    echo "  7) Watch Live Logs"
-    echo "  8) Router Doctor"
-    echo "  9) Configure TURN Server (COTURN)"
+    echo "  4) Internet Calling Guide (VPN/FQDN/COTURN scenarios)"
+    echo "  5) Interactive Firewall Guide (OPNsense/pfSense)"
+    echo "  6) Test SIP connectivity"
+    echo "  7) Verify CIDR/NAT config"
+    echo "  8) Watch Live Logs"
+    echo "  9) Router Doctor"
+    echo " 10) Configure TURN Server (COTURN)"
     echo "  0) Back"
     read -p "  Select: " choice
     case $choice in
         1) setup_internet_access ;;
         2) setup_caddy_cert_sync "force" ;;
         3) show_port_requirements ;;
-        4) show_firewall_guide ;;
-        5) test_sip_connectivity ;;
-        6) verify_cidr_config ;;
-        7) watch_live_logs ;;
-        8) router_doctor ;;
-        9) configure_coturn_menu ;;
+        4) show_internet_calling_guide ;;
+        5) show_firewall_guide ;;
+        6) test_sip_connectivity ;;
+        7) verify_cidr_config ;;
+        8) watch_live_logs ;;
+        9) router_doctor ;;
+        10) configure_coturn_menu ;;
         0) return ;;
     esac
     [[ "$choice" != "0" ]] && read -p "Press Enter..."
