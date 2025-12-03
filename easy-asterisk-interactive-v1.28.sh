@@ -67,6 +67,80 @@ generate_password() {
     tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16
 }
 
+select_user() {
+    # Scan /home for real users (exclude system accounts)
+    local -a users=()
+    local -a user_ids=()
+    local count=0
+
+    echo "Scanning for users..."
+    echo ""
+
+    # Get users from /home with valid shells
+    while IFS=: read -r username _ uid _ _ homedir shell; do
+        # Only include users with UID >= 1000 and valid shell
+        if [[ $uid -ge 1000 && -d "$homedir" && "$shell" != "/usr/sbin/nologin" && "$shell" != "/bin/false" ]]; then
+            ((count++))
+            users+=("$username")
+            user_ids+=("$uid")
+            echo "  ${count}) ${username} (UID: ${uid}, Home: ${homedir})"
+        fi
+    done < /etc/passwd
+
+    # Add option to manually enter username
+    ((count++))
+    echo "  ${count}) Enter username manually"
+    echo ""
+
+    # Suggest default based on SUDO_USER or first user found
+    local default_choice=""
+    local default_user="${SUDO_USER:-}"
+    if [[ -z "$default_user" ]]; then
+        default_user="${users[0]:-}"
+        default_choice="1"
+    else
+        # Find index of SUDO_USER
+        for i in "${!users[@]}"; do
+            if [[ "${users[$i]}" == "$default_user" ]]; then
+                default_choice=$((i + 1))
+                break
+            fi
+        done
+    fi
+
+    if [[ -n "$default_choice" ]]; then
+        read -p "Select user [${default_choice}]: " choice
+        choice="${choice:-$default_choice}"
+    else
+        read -p "Select user: " choice
+    fi
+
+    # Validate choice
+    if [[ "$choice" =~ ^[0-9]+$ && "$choice" -le "${#users[@]}" && "$choice" -gt 0 ]]; then
+        local idx=$((choice - 1))
+        KIOSK_USER="${users[$idx]}"
+        KIOSK_UID="${user_ids[$idx]}"
+        echo ""
+        print_success "Selected user: $KIOSK_USER (UID: $KIOSK_UID)"
+        return 0
+    elif [[ "$choice" == "$count" ]]; then
+        # Manual entry
+        echo ""
+        read -p "Enter username: " KIOSK_USER
+        if id "$KIOSK_USER" >/dev/null 2>&1; then
+            KIOSK_UID=$(id -u "$KIOSK_USER")
+            print_success "Selected user: $KIOSK_USER (UID: $KIOSK_UID)"
+            return 0
+        else
+            print_error "User '$KIOSK_USER' not found"
+            return 1
+        fi
+    else
+        print_error "Invalid selection"
+        return 1
+    fi
+}
+
 load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         source "$CONFIG_FILE" 2>/dev/null || true
@@ -993,6 +1067,30 @@ EOF
     chown -R ${KIOSK_USER}:${KIOSK_USER} "/home/${KIOSK_USER}/.config"
 }
 
+ensure_audio_unmuted() {
+    [[ -z "$KIOSK_USER" ]] && return
+    [[ -z "$KIOSK_UID" ]] && return
+
+    # Only unmute if PTT is not configured
+    if [[ ! -f /etc/easy-asterisk/ptt-device ]]; then
+        local user_dbus="XDG_RUNTIME_DIR=/run/user/${KIOSK_UID}"
+
+        # Wait a moment for PipeWire to initialize
+        sleep 2
+
+        # Unmute all sources and sinks
+        sudo -u "$KIOSK_USER" $user_dbus pactl set-source-mute @DEFAULT_SOURCE@ 0 2>/dev/null || true
+        sudo -u "$KIOSK_USER" $user_dbus pactl set-sink-mute @DEFAULT_SINK@ 0 2>/dev/null || true
+
+        # Set reasonable volume levels if they're at 0
+        local source_vol=$(sudo -u "$KIOSK_USER" $user_dbus pactl get-source-volume @DEFAULT_SOURCE@ 2>/dev/null | grep -oP '\d+%' | head -1 | tr -d '%')
+        local sink_vol=$(sudo -u "$KIOSK_USER" $user_dbus pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null | grep -oP '\d+%' | head -1 | tr -d '%')
+
+        [[ -n "$source_vol" && "$source_vol" -lt 50 ]] && sudo -u "$KIOSK_USER" $user_dbus pactl set-source-volume @DEFAULT_SOURCE@ 75% 2>/dev/null || true
+        [[ -n "$sink_vol" && "$sink_vol" -lt 50 ]] && sudo -u "$KIOSK_USER" $user_dbus pactl set-sink-volume @DEFAULT_SINK@ 75% 2>/dev/null || true
+    fi
+}
+
 # ================================================================
 # 6. DIAGNOSTICS & FIREWALL
 # ================================================================
@@ -1168,16 +1266,51 @@ router_doctor() {
 configure_local_client() {
     print_header "Configure Local Client"
     load_config
+
+    # If KIOSK_USER already set from config, show and ask if want to change
+    if [[ -n "$KIOSK_USER" ]]; then
+        echo "Current configured user: $KIOSK_USER"
+        read -p "Change user? [y/N]: " change_user
+        if [[ "$change_user" =~ ^[Yy]$ ]]; then
+            KIOSK_USER=""
+            KIOSK_UID=""
+        fi
+    fi
+
+    # If still no user, select one
     if [[ -z "$KIOSK_USER" ]]; then
-        local default_user="${SUDO_USER:-$USER}"
-        read -p "User [$default_user]: " KIOSK_USER
-        KIOSK_USER="${KIOSK_USER:-$default_user}"
+        echo ""
+        echo "Select the user to configure:"
+        echo ""
+        if ! select_user; then
+            print_error "User selection failed"
+            return 1
+        fi
+    else
+        # Ensure KIOSK_UID is set
         KIOSK_UID=$(id -u "$KIOSK_USER" 2>/dev/null)
     fi
-    
+
+    echo ""
+
     if [[ ! -d "/home/${KIOSK_USER}/.baresip" ]]; then
-        print_error "Baresip config not found for $KIOSK_USER"
-        return
+        print_error "Baresip not installed for $KIOSK_USER"
+        echo ""
+        read -p "Install Baresip client now? [Y/n]: " install_it
+        if [[ ! "$install_it" =~ ^[Nn]$ ]]; then
+            install_baresip_packages
+            configure_baresip
+            enable_client_services
+            INSTALLED_CLIENT="y"
+            save_config
+            print_success "Baresip installed"
+            echo ""
+            echo "Audio configured for $KIOSK_USER"
+            echo "If audio doesn't work, log out and back in or reboot."
+            echo ""
+        else
+            return
+        fi
     fi
     
     read -p "Extension: " ext
@@ -1246,7 +1379,7 @@ run_client_diagnostics() {
     local t_user="${KIOSK_USER:-$SUDO_USER}"
     t_user="${t_user:-$USER}"
     local t_uid=$(id -u "$t_user" 2>/dev/null)
-    
+
     echo -e "User: ${BOLD}$t_user${NC}"
     echo "---------------------------------------------------"
     if sudo -u "$t_user" XDG_RUNTIME_DIR=/run/user/$t_uid systemctl --user is-active baresip >/dev/null 2>&1; then
@@ -1254,6 +1387,47 @@ run_client_diagnostics() {
     else
         print_error "Baresip STOPPED/FAILED"
     fi
+    echo "---------------------------------------------------"
+
+    echo "Audio Services:"
+    local user_dbus="XDG_RUNTIME_DIR=/run/user/$t_uid"
+    if sudo -u "$t_user" $user_dbus systemctl --user is-active pipewire >/dev/null 2>&1; then
+        print_success "PipeWire RUNNING"
+    else
+        print_error "PipeWire STOPPED"
+    fi
+    if sudo -u "$t_user" $user_dbus systemctl --user is-active pipewire-pulse >/dev/null 2>&1; then
+        print_success "PipeWire-Pulse RUNNING"
+    else
+        print_error "PipeWire-Pulse STOPPED"
+    fi
+
+    echo ""
+    echo "Audio Status:"
+    local src_mute=$(sudo -u "$t_user" $user_dbus pactl get-source-mute @DEFAULT_SOURCE@ 2>/dev/null | awk '{print $2}')
+    local sink_mute=$(sudo -u "$t_user" $user_dbus pactl get-sink-mute @DEFAULT_SINK@ 2>/dev/null | awk '{print $2}')
+    local src_vol=$(sudo -u "$t_user" $user_dbus pactl get-source-volume @DEFAULT_SOURCE@ 2>/dev/null | grep -oP '\d+%' | head -1)
+    local sink_vol=$(sudo -u "$t_user" $user_dbus pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null | grep -oP '\d+%' | head -1)
+
+    echo "  Microphone: ${src_mute:-unknown} (Volume: ${src_vol:-unknown})"
+    echo "  Speaker:    ${sink_mute:-unknown} (Volume: ${sink_vol:-unknown})"
+
+    if [[ "$src_mute" == "yes" ]]; then
+        echo ""
+        print_error "MICROPHONE IS MUTED - No audio will be sent!"
+        echo "  To fix: pactl set-source-mute @DEFAULT_SOURCE@ 0"
+    fi
+
+    echo ""
+    echo "PTT Configuration:"
+    if [[ -f /etc/easy-asterisk/ptt-device ]]; then
+        echo "  PTT Mode: ENABLED"
+        source /etc/easy-asterisk/ptt-device 2>/dev/null
+        echo "  Device: ${PTT_DEVICE:-not set}"
+    else
+        echo "  PTT Mode: DISABLED (normal intercom mode)"
+    fi
+
     echo "---------------------------------------------------"
     
     echo "Network Interface:"
@@ -1742,13 +1916,18 @@ LAUNCHER
 enable_client_services() {
     local systemd_dir="/home/${KIOSK_USER}/.config/systemd/user"
     mkdir -p "$systemd_dir"
-    
+
+    # Ensure audio group membership
+    if ! id -nG "$KIOSK_USER" | grep -qw "audio"; then
+        usermod -aG audio "$KIOSK_USER"
+    fi
+
     # Baresip service
     cat > "${systemd_dir}/baresip.service" << EOF
 [Unit]
 Description=Baresip SIP Client
-After=pipewire.service network-online.target
-Wants=network-online.target pipewire.service
+After=pipewire.service pipewire-pulse.service network-online.target
+Wants=network-online.target pipewire.service pipewire-pulse.service
 
 [Service]
 Type=simple
@@ -1761,11 +1940,12 @@ Environment=XDG_RUNTIME_DIR=/run/user/${KIOSK_UID}
 WantedBy=default.target
 EOF
 
-    # PTT service
+    # PTT service - only create if PTT is configured
     cat > "${systemd_dir}/kiosk-ptt.service" << EOF
 [Unit]
 Description=PTT Button Handler
 After=pipewire.service
+ConditionPathExists=/etc/easy-asterisk/ptt-device
 
 [Service]
 Type=simple
@@ -1778,15 +1958,30 @@ Environment=XDG_RUNTIME_DIR=/run/user/${KIOSK_UID}
 [Install]
 WantedBy=default.target
 EOF
-    
+
     chown -R ${KIOSK_USER}:${KIOSK_USER} "/home/${KIOSK_USER}/.config"
-    
+
     if [[ -n "$KIOSK_USER" ]]; then
         loginctl enable-linger $KIOSK_USER 2>/dev/null || true
         local user_dbus="XDG_RUNTIME_DIR=/run/user/${KIOSK_UID}"
+
+        # Enable and start PipeWire services for the user
         sudo -u "$KIOSK_USER" $user_dbus systemctl --user daemon-reload
-        sudo -u "$KIOSK_USER" $user_dbus systemctl --user enable baresip kiosk-ptt
-        sudo -u "$KIOSK_USER" $user_dbus systemctl --user restart baresip kiosk-ptt
+        sudo -u "$KIOSK_USER" $user_dbus systemctl --user enable pipewire pipewire-pulse 2>/dev/null || true
+        sudo -u "$KIOSK_USER" $user_dbus systemctl --user restart pipewire pipewire-pulse 2>/dev/null || true
+
+        # Enable baresip
+        sudo -u "$KIOSK_USER" $user_dbus systemctl --user enable baresip
+
+        # Only enable PTT if configured
+        if [[ -f /etc/easy-asterisk/ptt-device ]]; then
+            sudo -u "$KIOSK_USER" $user_dbus systemctl --user enable kiosk-ptt
+            sudo -u "$KIOSK_USER" $user_dbus systemctl --user restart baresip kiosk-ptt
+        else
+            sudo -u "$KIOSK_USER" $user_dbus systemctl --user restart baresip
+            # Ensure audio is unmuted for normal kiosk operation
+            ensure_audio_unmuted
+        fi
     fi
 }
 
@@ -2064,15 +2259,15 @@ install_server_only() {
 
 install_client_only() {
     print_header "Client Installation"
-    local default_user="${SUDO_USER:-$USER}"
-    read -p "User [$default_user]: " target_user
-    KIOSK_USER="${target_user:-$default_user}"
-    KIOSK_UID=$(id -u "$KIOSK_USER")
-    
-    if ! id -nG "$KIOSK_USER" | grep -qw "audio"; then
-        usermod -aG audio "$KIOSK_USER"
+    echo "Select the user to install the kiosk client for:"
+    echo ""
+
+    if ! select_user; then
+        print_error "User selection failed"
+        return 1
     fi
 
+    echo ""
     read -p "Server (IP or domain): " ASTERISK_HOST
     read -p "SIP Password: " SIP_PASSWORD
     
@@ -2096,7 +2291,25 @@ install_client_only() {
     configure_baresip
     enable_client_services
     save_config
+
     print_success "Client installed"
+    echo ""
+    echo "════════════════════════════════════════════════════════"
+    echo "  IMPORTANT: Audio Configuration"
+    echo "════════════════════════════════════════════════════════"
+    echo "  User: $KIOSK_USER"
+    echo "  - Audio group: Added"
+    echo "  - PipeWire services: Enabled"
+    echo "  - Microphone: Unmuted (for intercom mode)"
+    echo ""
+    echo "  If audio doesn't work immediately:"
+    echo "  1. Log out and log back in as '$KIOSK_USER'"
+    echo "  2. Or reboot the system"
+    echo "  3. Check audio with: pactl list sources short"
+    echo ""
+    echo "  PTT Mode: Not configured (normal intercom operation)"
+    echo "  To configure PTT: Main Menu > Configure PTT"
+    echo "════════════════════════════════════════════════════════"
 }
 
 collect_common_config() {
