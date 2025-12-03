@@ -67,6 +67,80 @@ generate_password() {
     tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16
 }
 
+select_user() {
+    # Scan /home for real users (exclude system accounts)
+    local -a users=()
+    local -a user_ids=()
+    local count=0
+
+    echo "Scanning for users..."
+    echo ""
+
+    # Get users from /home with valid shells
+    while IFS=: read -r username _ uid _ _ homedir shell; do
+        # Only include users with UID >= 1000 and valid shell
+        if [[ $uid -ge 1000 && -d "$homedir" && "$shell" != "/usr/sbin/nologin" && "$shell" != "/bin/false" ]]; then
+            ((count++))
+            users+=("$username")
+            user_ids+=("$uid")
+            echo "  ${count}) ${username} (UID: ${uid}, Home: ${homedir})"
+        fi
+    done < /etc/passwd
+
+    # Add option to manually enter username
+    ((count++))
+    echo "  ${count}) Enter username manually"
+    echo ""
+
+    # Suggest default based on SUDO_USER or first user found
+    local default_choice=""
+    local default_user="${SUDO_USER:-}"
+    if [[ -z "$default_user" ]]; then
+        default_user="${users[0]:-}"
+        default_choice="1"
+    else
+        # Find index of SUDO_USER
+        for i in "${!users[@]}"; do
+            if [[ "${users[$i]}" == "$default_user" ]]; then
+                default_choice=$((i + 1))
+                break
+            fi
+        done
+    fi
+
+    if [[ -n "$default_choice" ]]; then
+        read -p "Select user [${default_choice}]: " choice
+        choice="${choice:-$default_choice}"
+    else
+        read -p "Select user: " choice
+    fi
+
+    # Validate choice
+    if [[ "$choice" =~ ^[0-9]+$ && "$choice" -le "${#users[@]}" && "$choice" -gt 0 ]]; then
+        local idx=$((choice - 1))
+        KIOSK_USER="${users[$idx]}"
+        KIOSK_UID="${user_ids[$idx]}"
+        echo ""
+        print_success "Selected user: $KIOSK_USER (UID: $KIOSK_UID)"
+        return 0
+    elif [[ "$choice" == "$count" ]]; then
+        # Manual entry
+        echo ""
+        read -p "Enter username: " KIOSK_USER
+        if id "$KIOSK_USER" >/dev/null 2>&1; then
+            KIOSK_UID=$(id -u "$KIOSK_USER")
+            print_success "Selected user: $KIOSK_USER (UID: $KIOSK_UID)"
+            return 0
+        else
+            print_error "User '$KIOSK_USER' not found"
+            return 1
+        fi
+    else
+        print_error "Invalid selection"
+        return 1
+    fi
+}
+
 load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         source "$CONFIG_FILE" 2>/dev/null || true
@@ -1192,12 +1266,32 @@ router_doctor() {
 configure_local_client() {
     print_header "Configure Local Client"
     load_config
+
+    # If KIOSK_USER already set from config, show and ask if want to change
+    if [[ -n "$KIOSK_USER" ]]; then
+        echo "Current configured user: $KIOSK_USER"
+        read -p "Change user? [y/N]: " change_user
+        if [[ "$change_user" =~ ^[Yy]$ ]]; then
+            KIOSK_USER=""
+            KIOSK_UID=""
+        fi
+    fi
+
+    # If still no user, select one
     if [[ -z "$KIOSK_USER" ]]; then
-        local default_user="${SUDO_USER:-$USER}"
-        read -p "User [$default_user]: " KIOSK_USER
-        KIOSK_USER="${KIOSK_USER:-$default_user}"
+        echo ""
+        echo "Select the user to configure:"
+        echo ""
+        if ! select_user; then
+            print_error "User selection failed"
+            return 1
+        fi
+    else
+        # Ensure KIOSK_UID is set
         KIOSK_UID=$(id -u "$KIOSK_USER" 2>/dev/null)
     fi
+
+    echo ""
 
     if [[ ! -d "/home/${KIOSK_USER}/.baresip" ]]; then
         print_error "Baresip not installed for $KIOSK_USER"
@@ -2165,11 +2259,15 @@ install_server_only() {
 
 install_client_only() {
     print_header "Client Installation"
-    local default_user="${SUDO_USER:-$USER}"
-    read -p "User [$default_user]: " target_user
-    KIOSK_USER="${target_user:-$default_user}"
-    KIOSK_UID=$(id -u "$KIOSK_USER")
+    echo "Select the user to install the kiosk client for:"
+    echo ""
 
+    if ! select_user; then
+        print_error "User selection failed"
+        return 1
+    fi
+
+    echo ""
     read -p "Server (IP or domain): " ASTERISK_HOST
     read -p "SIP Password: " SIP_PASSWORD
     
