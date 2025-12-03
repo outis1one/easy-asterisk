@@ -73,6 +73,12 @@
 
 set +e
 
+# Version and Update Info
+SCRIPT_VERSION="1.25"
+GITHUB_REPO="outis1one/asterisk-easy"
+SCRIPT_NAME="easy-asterisk-interactive-v1.25.sh"
+BACKUP_DIR="/etc/easy-asterisk/backups"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -2552,6 +2558,232 @@ setup_internet_access() {
 }
 
 # ================================================================
+# 9A. UPDATE SYSTEM
+# ================================================================
+
+check_for_updates() {
+    print_header "Check for Updates"
+
+    echo "Current Version: ${BOLD}v${SCRIPT_VERSION}${NC}"
+    echo ""
+    echo "Checking GitHub for latest release..."
+    echo ""
+
+    # Fetch latest release from GitHub
+    local latest_info=$(curl -s "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null)
+
+    if [[ -z "$latest_info" ]] || echo "$latest_info" | grep -q "API rate limit"; then
+        print_warn "Unable to check for updates (GitHub API unavailable or rate limited)"
+        echo ""
+        echo "You can manually check: https://github.com/${GITHUB_REPO}/releases"
+        return 1
+    fi
+
+    # Parse version and download URL
+    local latest_version=$(echo "$latest_info" | grep -oP '"tag_name":\s*"v?\K[0-9]+\.[0-9]+')
+    local release_url=$(echo "$latest_info" | grep -oP '"html_url":\s*"\K[^"]+' | head -1)
+    local download_url=$(echo "$latest_info" | grep -oP '"browser_download_url":\s*"\K[^"]+' | grep "\.sh$" | head -1)
+
+    if [[ -z "$latest_version" ]]; then
+        print_warn "Could not determine latest version"
+        return 1
+    fi
+
+    echo "Latest Version:  ${BOLD}v${latest_version}${NC}"
+    echo ""
+
+    # Compare versions
+    if [[ "$SCRIPT_VERSION" == "$latest_version" ]]; then
+        print_success "You are running the latest version!"
+        return 0
+    fi
+
+    # Version comparison (simple numeric)
+    local current_num=$(echo "$SCRIPT_VERSION" | tr -d '.')
+    local latest_num=$(echo "$latest_version" | tr -d '.')
+
+    if [[ "$current_num" -gt "$latest_num" ]]; then
+        print_info "You are running a NEWER version (development/testing)"
+        return 0
+    fi
+
+    # Update available
+    print_warn "Update available: v${SCRIPT_VERSION} → v${latest_version}"
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  ${YELLOW}⚠  IMPORTANT: Read About Breaking Changes${NC}              ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Before updating, please review the changelog:"
+    echo "  ${CYAN}${release_url}${NC}"
+    echo ""
+    echo "Breaking changes, new features, and migration notes are documented there."
+    echo ""
+    read -p "Continue with update? [y/N]: " do_update
+
+    if [[ "$do_update" =~ ^[Yy]$ ]]; then
+        perform_update "$latest_version" "$download_url" "$release_url"
+    else
+        print_info "Update cancelled"
+    fi
+}
+
+perform_update() {
+    local new_version=$1
+    local download_url=$2
+    local release_url=$3
+
+    print_header "Updating to v${new_version}"
+
+    # Create backup directory
+    mkdir -p "$BACKUP_DIR"
+    local backup_timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_file="${BACKUP_DIR}/easy-asterisk-v${SCRIPT_VERSION}_${backup_timestamp}.sh"
+
+    # Backup current script
+    echo "Creating backup..."
+    local script_path=$(readlink -f "$0")
+    cp "$script_path" "$backup_file"
+
+    if [[ ! -f "$backup_file" ]]; then
+        print_error "Failed to create backup!"
+        return 1
+    fi
+
+    print_success "Backup created: $backup_file"
+    echo ""
+
+    # Backup configuration
+    if [[ -d "$CONFIG_DIR" ]]; then
+        local config_backup="${BACKUP_DIR}/config_${backup_timestamp}.tar.gz"
+        tar -czf "$config_backup" -C "$CONFIG_DIR" . 2>/dev/null
+        print_success "Config backup: $config_backup"
+    fi
+
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║  Rollback Instructions (if needed)                         ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "If the new version has issues, restore the backup:"
+    echo "  ${CYAN}cp $backup_file $script_path${NC}"
+    echo ""
+    echo "To restore config:"
+    echo "  ${CYAN}tar -xzf ${BACKUP_DIR}/config_${backup_timestamp}.tar.gz -C $CONFIG_DIR${NC}"
+    echo ""
+    read -p "Press Enter to continue with update..."
+
+    # Download new version
+    echo ""
+    echo "Downloading v${new_version}..."
+
+    if [[ -n "$download_url" ]]; then
+        # Download from release asset
+        local temp_file="/tmp/easy-asterisk-update-${new_version}.sh"
+        if curl -fsSL "$download_url" -o "$temp_file"; then
+            chmod +x "$temp_file"
+            cp "$temp_file" "$script_path"
+            rm -f "$temp_file"
+            print_success "Update downloaded and installed!"
+        else
+            print_error "Download failed!"
+            echo "Manual update: Download from ${release_url}"
+            return 1
+        fi
+    else
+        # Fallback: clone repo and copy script
+        print_warn "Direct download not available, using git clone method..."
+        local temp_dir="/tmp/easy-asterisk-update-$$"
+        if git clone --depth 1 "https://github.com/${GITHUB_REPO}.git" "$temp_dir" 2>/dev/null; then
+            local new_script=$(find "$temp_dir" -name "easy-asterisk-interactive-v${new_version}.sh" -o -name "easy-asterisk-interactive-v*.sh" | sort -V | tail -1)
+            if [[ -f "$new_script" ]]; then
+                chmod +x "$new_script"
+                cp "$new_script" "$script_path"
+                rm -rf "$temp_dir"
+                print_success "Update installed via git!"
+            else
+                print_error "Could not find script in repository"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+        else
+            print_error "Git clone failed!"
+            echo "Manual update: Download from ${release_url}"
+            return 1
+        fi
+    fi
+
+    echo ""
+    print_success "Update complete: v${SCRIPT_VERSION} → v${new_version}"
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+    echo "${BOLD}What's Next:${NC}"
+    echo "  1. Review changelog: ${release_url}"
+    echo "  2. Restart services if needed (offered below)"
+    echo "  3. Test your configuration"
+    echo ""
+
+    # Offer to restart services
+    if systemctl is-active asterisk >/dev/null 2>&1 || systemctl is-active baresip >/dev/null 2>&1; then
+        read -p "Restart Asterisk and Baresip services now? [Y/n]: " restart_services
+        if [[ ! "$restart_services" =~ ^[Nn]$ ]]; then
+            restart_all_services
+        fi
+    fi
+
+    echo ""
+    print_warn "Script has been updated. Please re-run it to use the new version:"
+    echo "  ${CYAN}sudo $script_path${NC}"
+    echo ""
+    read -p "Press Enter to exit..."
+    exit 0
+}
+
+restart_all_services() {
+    print_header "Restarting Services"
+
+    # Restart Asterisk
+    if systemctl is-active asterisk >/dev/null 2>&1; then
+        echo "Restarting Asterisk..."
+        systemctl restart asterisk
+        if systemctl is-active asterisk >/dev/null 2>&1; then
+            print_success "Asterisk restarted"
+        else
+            print_error "Asterisk failed to restart"
+            echo "Check logs: journalctl -u asterisk -n 50"
+        fi
+    fi
+
+    # Restart Baresip (user service)
+    if [[ -n "$KIOSK_USER" && -n "$KIOSK_UID" ]]; then
+        local user_dbus="XDG_RUNTIME_DIR=/run/user/${KIOSK_UID}"
+        if sudo -u "$KIOSK_USER" $user_dbus systemctl --user is-active baresip >/dev/null 2>&1; then
+            echo "Restarting Baresip..."
+            sudo -u "$KIOSK_USER" $user_dbus systemctl --user restart baresip kiosk-ptt 2>/dev/null
+            sleep 2
+            if sudo -u "$KIOSK_USER" $user_dbus systemctl --user is-active baresip >/dev/null 2>&1; then
+                print_success "Baresip restarted"
+            else
+                print_error "Baresip failed to restart"
+                echo "Check logs: sudo -u $KIOSK_USER journalctl --user -u baresip -n 50"
+            fi
+        fi
+    fi
+
+    # Restart COTURN
+    if systemctl is-active coturn >/dev/null 2>&1; then
+        echo "Restarting COTURN..."
+        systemctl restart coturn
+        if systemctl is-active coturn >/dev/null 2>&1; then
+            print_success "COTURN restarted"
+        else
+            print_error "COTURN failed to restart"
+        fi
+    fi
+}
+
+# ================================================================
 # 10. INSTALLATION
 # ================================================================
 
@@ -2934,11 +3166,13 @@ submenu_tools() {
     print_header "Tools"
     echo "  1) Audio Test"
     echo "  2) Verify Audio/Codec Setup"
+    echo "  3) Check for Updates"
     echo "  0) Back"
     read -p "  Select: " choice
     case $choice in
         1) run_audio_test ;;
         2) verify_audio_setup ;;
+        3) check_for_updates ;;
         0) return ;;
     esac
     [[ "$choice" != "0" ]] && read -p "Press Enter..."
