@@ -1,11 +1,23 @@
 #!/bin/bash
 # ================================================================
-# Easy Asterisk - Interactive Installer v1.23
-# 
-# UPDATES in v1.23:
-# - CLARIFIED: Router Guide now explicitly separates VLAN (Allow) vs WAN (NAT)
-# - ADDED: Caddy Helper now generates snippets for both SIP and TURN domains
-# - RETAINED: PTT Mute-default, Audio Ducking, Device Management
+# Easy Asterisk - Interactive Installer v1.28
+#
+# UPDATES in v1.28:
+# - FIXED: Device display now correctly shows UDP/5060 for LAN-only installs
+# - FIXED: Device display shows TLS/5061 only when internet/certs configured
+# - FIXED: SRTP shown as "Required" only with TLS, "Not required" for UDP
+# - FIXED: ICE support only enabled for FQDN/internet calling, not LAN-only
+# - FIXED: RTP config - icesupport and STUN only enabled for FQDN setups
+# - ADDED: Informative message after server install before internet setup prompt
+# - ADDED: load_config call in add_device_menu to properly read saved settings
+#
+# This fixes the issue where LAN-only servers incorrectly showed TLS/SRTP
+# requirements when adding devices, preventing proper UDP registration.
+#
+# RETAINED from v1.23:
+# - Router Guide separates VLAN (Allow) vs WAN (NAT)
+# - Caddy Helper generates snippets for both SIP and TURN domains
+# - PTT Mute-default, Audio Ducking, Device Management
 # ================================================================
 
 set +e
