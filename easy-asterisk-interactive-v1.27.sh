@@ -987,8 +987,13 @@ EOF
     echo "  Server:    ${DOMAIN_NAME:-$(hostname -I | awk '{print $1}')}"
     echo "  Extension: $ext"
     echo "  Password:  $pass"
-    echo "  Transport: TLS (port 5061)"
-    echo "  SRTP:      Required"
+    if [[ "$ENABLE_TLS" == "y" ]]; then
+        echo "  Transport: TLS (port 5061)"
+        echo "  SRTP:      Required"
+    else
+        echo "  Transport: UDP (port 5060)"
+        echo "  SRTP:      Not required"
+    fi
     if [[ "$USE_COTURN" == "y" ]]; then
         echo "  TURN:      ${TURN_DOMAIN:-${DOMAIN_NAME:-$CURRENT_PUBLIC_IP}}:${DEFAULT_TURN_PORT}"
     fi
@@ -2797,7 +2802,6 @@ restart_all_services() {
 install_quick_local() {
     print_header "Quick Local Network Setup"
 
-    echo "This is the recommended setup for 90% of users:"
     echo -e "  ${GREEN}✓${NC} Local network only (no internet)"
     echo -e "  ${GREEN}✓${NC} PTT (push-to-talk) with mute-by-default"
     echo -e "  ${GREEN}✓${NC} Auto-answer for kiosks"
