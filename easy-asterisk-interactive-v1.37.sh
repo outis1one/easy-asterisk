@@ -1,6 +1,12 @@
 #!/bin/bash
 # ================================================================
-# Easy Asterisk - Interactive Installer v1.37
+# Easy Asterisk - Interactive Installer v1.37.1
+#
+# BUG FIXES in v1.37.1:
+# - FIXED: Function name bug (rebuild_pjsip_config → generate_pjsip_conf)
+# - FIXED: Uninstall menu now adapts based on what's installed
+# - IMPROVED: Better Asterisk failure diagnostics (shows cert status)
+# - IMPROVED: Port forwarding instructions now say "router" not "OPNsense"
 #
 # MAJOR UPDATES in v1.37:
 # - ADDED: VLAN/NAT Traversal toggle (Server Tools menu option 8)
@@ -41,7 +47,7 @@ PTT_CONFIG_FILE="${CONFIG_DIR}/ptt-device"
 CATEGORIES_FILE="${CONFIG_DIR}/categories.conf"
 ROOMS_FILE="${CONFIG_DIR}/rooms.conf"
 COTURN_CONFIG="/etc/turnserver.conf"
-SCRIPT_VERSION="1.37"
+SCRIPT_VERSION="1.37.1"
 
 # ================================================================
 # 1. CORE HELPER FUNCTIONS
@@ -368,7 +374,7 @@ setup_fqdn_access() {
     echo "  ROUTER PORT FORWARDING REQUIRED"
     echo "═══════════════════════════════════════════════════════════════"
     echo ""
-    echo "  On your OPNsense router, create these WAN port forwards:"
+    echo "  On your router, configure these port forwards:"
     echo ""
     echo "  ┌──────────────────┬──────────┬─────────────────────────────┐"
     echo "  │ WAN Port         │ Protocol │ Forward To                  │"
@@ -377,7 +383,7 @@ setup_fqdn_access() {
     echo "  │ 10000-20000      │ UDP      │ ${SERVER_LAN_IP}:10000-20000│"
     echo "  └──────────────────┴──────────┴─────────────────────────────┘"
     echo ""
-    echo "  Path: Firewall → NAT → Port Forward"
+    echo "  (Usually found in: Firewall → NAT → Port Forward)"
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
     echo ""
@@ -556,7 +562,7 @@ toggle_vlan_nat_traversal() {
             print_info "Enabling VLAN/NAT traversal..."
             VLAN_NAT_TRAVERSAL="y"
             save_config
-            rebuild_pjsip_config
+            generate_pjsip_conf
             asterisk -rx "pjsip reload" >/dev/null 2>&1
             echo ""
             print_success "VLAN/NAT traversal ENABLED"
@@ -574,7 +580,7 @@ toggle_vlan_nat_traversal() {
                 if [[ -n "$subnets" ]]; then
                     VLAN_SUBNETS="$subnets"
                     save_config
-                    rebuild_pjsip_config
+                    generate_pjsip_conf
                     asterisk -rx "pjsip reload" >/dev/null 2>&1
                     print_success "VLAN subnets configured"
                 fi
@@ -585,7 +591,7 @@ toggle_vlan_nat_traversal() {
             VLAN_NAT_TRAVERSAL="n"
             VLAN_SUBNETS=""
             save_config
-            rebuild_pjsip_config
+            generate_pjsip_conf
             asterisk -rx "pjsip reload" >/dev/null 2>&1
             echo ""
             print_success "VLAN/NAT traversal DISABLED"
@@ -603,7 +609,7 @@ toggle_vlan_nat_traversal() {
             save_config
 
             if [[ "$VLAN_NAT_TRAVERSAL" == "y" ]]; then
-                rebuild_pjsip_config
+                generate_pjsip_conf
                 asterisk -rx "pjsip reload" >/dev/null 2>&1
                 print_success "VLAN subnets updated and applied"
             else
@@ -1679,12 +1685,40 @@ restart_asterisk_safe() {
     rm -f /var/run/asterisk/asterisk.pid 2>/dev/null
     systemctl start asterisk
     sleep 3
-    
+
     if systemctl is-active asterisk >/dev/null; then
         print_success "Asterisk running"
     else
-        print_error "Asterisk failed"
-        journalctl -u asterisk -n 10 --no-pager
+        print_error "Asterisk failed to start"
+        echo ""
+        echo "Recent log entries:"
+        journalctl -u asterisk -n 20 --no-pager
+        echo ""
+        echo "Checking configuration files..."
+
+        # Check if pjsip.conf has syntax errors
+        if asterisk -rx "pjsip show version" &>/dev/null; then
+            echo "PJSIP module OK"
+        else
+            echo "PJSIP may have configuration errors"
+        fi
+
+        # Check certificate files
+        if [[ -f /etc/asterisk/certs/server.crt ]]; then
+            echo "Certificate file exists"
+        else
+            echo "WARNING: Missing /etc/asterisk/certs/server.crt"
+        fi
+
+        if [[ -f /etc/asterisk/certs/server.key ]]; then
+            echo "Private key exists"
+        else
+            echo "WARNING: Missing /etc/asterisk/certs/server.key"
+        fi
+
+        echo ""
+        echo "To debug further, run: sudo asterisk -cvvv"
+        echo ""
     fi
 }
 
@@ -2075,34 +2109,71 @@ install_baresip_packages() {
 
 uninstall_menu() {
     print_header "Uninstall"
-    echo "  1) Remove Everything"
-    echo "  2) Asterisk Only"
-    echo "  3) Baresip Only"
+    load_config
+
+    # Build menu based on what's installed
+    local has_server=$([[ "$INSTALLED_SERVER" == "y" ]] && echo "y" || echo "n")
+    local has_client=$([[ "$INSTALLED_CLIENT" == "y" ]] && echo "y" || echo "n")
+
+    if [[ "$has_server" == "y" && "$has_client" == "y" ]]; then
+        echo "  1) Remove Everything"
+        echo "  2) Asterisk Only"
+        echo "  3) Baresip Only"
+    elif [[ "$has_server" == "y" ]]; then
+        echo "  1) Remove Asterisk"
+    elif [[ "$has_client" == "y" ]]; then
+        echo "  1) Remove Baresip"
+    else
+        print_warn "Nothing installed"
+        return
+    fi
+
     echo "  0) Cancel"
     read -p "Select: " ch
+
     case $ch in
         1)
-            systemctl stop asterisk 2>/dev/null
-            apt purge -y asterisk* baresip baresip-core 2>/dev/null
-            rm -rf /etc/asterisk /var/lib/asterisk /etc/easy-asterisk
-            [[ -n "$KIOSK_USER" ]] && rm -rf "/home/${KIOSK_USER}/.baresip"
-            systemctl daemon-reload
-            print_success "Removed all"
+            if [[ "$has_server" == "y" && "$has_client" == "y" ]]; then
+                # Remove everything
+                systemctl stop asterisk 2>/dev/null
+                apt purge -y asterisk* baresip baresip-core 2>/dev/null
+                rm -rf /etc/asterisk /var/lib/asterisk /etc/easy-asterisk
+                [[ -n "$KIOSK_USER" ]] && rm -rf "/home/${KIOSK_USER}/.baresip"
+                systemctl daemon-reload
+                print_success "Removed all"
+            elif [[ "$has_server" == "y" ]]; then
+                # Remove server only
+                systemctl stop asterisk 2>/dev/null
+                apt purge -y asterisk* 2>/dev/null
+                rm -rf /etc/asterisk /var/lib/asterisk /etc/easy-asterisk
+                systemctl daemon-reload
+                print_success "Removed Asterisk"
+            elif [[ "$has_client" == "y" ]]; then
+                # Remove client only
+                apt purge -y baresip baresip-core 2>/dev/null
+                [[ -n "$KIOSK_USER" ]] && rm -rf "/home/${KIOSK_USER}/.baresip"
+                rm -rf /etc/easy-asterisk
+                print_success "Removed Baresip"
+            fi
             ;;
         2)
-            systemctl stop asterisk 2>/dev/null
-            apt purge -y asterisk* 2>/dev/null
-            rm -rf /etc/asterisk /var/lib/asterisk
-            INSTALLED_SERVER="n"
-            save_config
-            print_success "Removed Asterisk"
+            if [[ "$has_server" == "y" && "$has_client" == "y" ]]; then
+                systemctl stop asterisk 2>/dev/null
+                apt purge -y asterisk* 2>/dev/null
+                rm -rf /etc/asterisk /var/lib/asterisk
+                INSTALLED_SERVER="n"
+                save_config
+                print_success "Removed Asterisk"
+            fi
             ;;
         3)
-            apt purge -y baresip baresip-core 2>/dev/null
-            [[ -n "$KIOSK_USER" ]] && rm -rf "/home/${KIOSK_USER}/.baresip"
-            INSTALLED_CLIENT="n"
-            save_config
-            print_success "Removed Baresip"
+            if [[ "$has_server" == "y" && "$has_client" == "y" ]]; then
+                apt purge -y baresip baresip-core 2>/dev/null
+                [[ -n "$KIOSK_USER" ]] && rm -rf "/home/${KIOSK_USER}/.baresip"
+                INSTALLED_CLIENT="n"
+                save_config
+                print_success "Removed Baresip"
+            fi
             ;;
     esac
 }
