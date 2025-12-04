@@ -1,24 +1,24 @@
 #!/bin/bash
 # ================================================================
-# Easy Asterisk - Interactive Installer v1.30
+# Easy Asterisk - Interactive Installer v1.37
 #
-# MAJOR UPDATES in v1.30:
-# - SIMPLIFIED: Two client types - LAN/VPN (IP) or FQDN (domain)
-# - ADDED: Per-device connection type selection
-# - ADDED: Clear setup wizard for FQDN access
-# - FIXED: Cross-VLAN clients properly handled as FQDN clients
-# - IMPROVED: Cleaner network configuration flow
+# MAJOR UPDATES in v1.37:
+# - ADDED: VLAN/NAT Traversal toggle (Server Tools menu option 8)
+# - ADDED: Optional VLAN subnet configuration
+# - IMPROVED: Support for devices on VLANs without inter-VLAN routing
+# - COMPATIBLE: Works with flat networks, VLANs, VPNs, and FQDN modes
 #
-# CLIENT TYPES:
-#   LAN/VPN  - Connect via server IP, UDP/5060, no encryption needed
-#   FQDN     - Connect via domain name, TLS/5061, requires port forward
-#            (This includes cross-VLAN clients using hairpin NAT)
+# NEW FEATURE - VLAN/NAT Traversal:
+#   Enables communication with devices on VLANs without requiring
+#   inter-VLAN routing. Uses symmetric RTP and dynamic NAT handling
+#   to respond to packets at their source address.
 #
-# RETAINED from v1.29:
+# RETAINED from v1.30:
+# - Two client types: LAN/VPN (IP) or FQDN (domain)
+# - Per-device connection type selection
+# - FQDN access setup wizard
 # - Kiosk client fixes (DBUS, PipeWire deps)
-# - PTT button fixes
-# - Smart user detection
-# - Comprehensive logging
+# - PTT button configuration
 # ================================================================
 
 set +e
@@ -41,7 +41,7 @@ PTT_CONFIG_FILE="${CONFIG_DIR}/ptt-device"
 CATEGORIES_FILE="${CONFIG_DIR}/categories.conf"
 ROOMS_FILE="${CONFIG_DIR}/rooms.conf"
 COTURN_CONFIG="/etc/turnserver.conf"
-SCRIPT_VERSION="1.30"
+SCRIPT_VERSION="1.37"
 
 # ================================================================
 # 1. CORE HELPER FUNCTIONS
@@ -220,6 +220,8 @@ load_config() {
     TURN_PASS="${TURN_PASS:-}"
     TURN_DOMAIN="${TURN_DOMAIN:-}"
     FQDN_ENABLED="${FQDN_ENABLED:-n}"
+    VLAN_NAT_TRAVERSAL="${VLAN_NAT_TRAVERSAL:-n}"
+    VLAN_SUBNETS="${VLAN_SUBNETS:-}"
     return 0
 }
 
@@ -255,6 +257,8 @@ USE_COTURN="$USE_COTURN"
 TURN_SECRET="$TURN_SECRET"
 TURN_USER="$TURN_USER"
 TURN_PASS="$TURN_PASS"
+VLAN_NAT_TRAVERSAL="$VLAN_NAT_TRAVERSAL"
+VLAN_SUBNETS="$VLAN_SUBNETS"
 CURRENT_PUBLIC_IP="$CURRENT_PUBLIC_IP"
 PTT_DEVICE="$PTT_DEVICE"
 PTT_KEYCODE="$PTT_KEYCODE"
@@ -510,6 +514,109 @@ EOF
         journalctl -u coturn -n 20 --no-pager
         return 1
     fi
+}
+
+toggle_vlan_nat_traversal() {
+    print_header "VLAN/NAT Traversal Configuration"
+    load_config
+
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  VLAN/NAT TRAVERSAL SETTINGS"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+    echo "  This feature helps devices on VLANs communicate with the"
+    echo "  Asterisk server without requiring inter-VLAN routing."
+    echo ""
+    echo "  It works by treating VLAN traffic similar to NAT traversal,"
+    echo "  sending responses back to the source address of incoming packets."
+    echo ""
+    echo "  Current status: $(if [[ "$VLAN_NAT_TRAVERSAL" == "y" ]]; then echo -e "${GREEN}ENABLED${NC}"; else echo -e "${YELLOW}DISABLED${NC}"; fi)"
+    echo ""
+
+    if [[ -n "$VLAN_SUBNETS" ]]; then
+        echo "  Configured VLAN subnets:"
+        IFS=',' read -ra SUBNETS <<< "$VLAN_SUBNETS"
+        for subnet in "${SUBNETS[@]}"; do
+            echo "    - $subnet"
+        done
+        echo ""
+    fi
+
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+    echo "  1) Enable VLAN/NAT traversal"
+    echo "  2) Disable VLAN/NAT traversal"
+    echo "  3) Configure VLAN subnets (optional)"
+    echo "  0) Back"
+    echo ""
+    read -p "  Select: " choice
+
+    case $choice in
+        1)
+            print_info "Enabling VLAN/NAT traversal..."
+            VLAN_NAT_TRAVERSAL="y"
+            save_config
+            rebuild_pjsip_config
+            asterisk -rx "pjsip reload" >/dev/null 2>&1
+            echo ""
+            print_success "VLAN/NAT traversal ENABLED"
+            echo ""
+            echo "  Asterisk will now respond to the source address of incoming"
+            echo "  packets, allowing VLAN devices to connect properly."
+            echo ""
+
+            read -p "  Do you want to configure VLAN subnets now? [y/N]: " config_subnets
+            if [[ "$config_subnets" =~ ^[Yy]$ ]]; then
+                echo ""
+                echo "  Enter VLAN subnets (comma-separated, e.g., 192.168.10.0/24,192.168.20.0/24)"
+                echo "  Leave empty to skip:"
+                read -p "  > " subnets
+                if [[ -n "$subnets" ]]; then
+                    VLAN_SUBNETS="$subnets"
+                    save_config
+                    rebuild_pjsip_config
+                    asterisk -rx "pjsip reload" >/dev/null 2>&1
+                    print_success "VLAN subnets configured"
+                fi
+            fi
+            ;;
+        2)
+            print_info "Disabling VLAN/NAT traversal..."
+            VLAN_NAT_TRAVERSAL="n"
+            VLAN_SUBNETS=""
+            save_config
+            rebuild_pjsip_config
+            asterisk -rx "pjsip reload" >/dev/null 2>&1
+            echo ""
+            print_success "VLAN/NAT traversal DISABLED"
+            echo ""
+            echo "  Configuration restored to default (flat network only)."
+            ;;
+        3)
+            echo ""
+            echo "  Current subnets: ${VLAN_SUBNETS:-none}"
+            echo ""
+            echo "  Enter VLAN subnets (comma-separated, e.g., 192.168.10.0/24,192.168.20.0/24)"
+            echo "  Leave empty to clear:"
+            read -p "  > " subnets
+            VLAN_SUBNETS="$subnets"
+            save_config
+
+            if [[ "$VLAN_NAT_TRAVERSAL" == "y" ]]; then
+                rebuild_pjsip_config
+                asterisk -rx "pjsip reload" >/dev/null 2>&1
+                print_success "VLAN subnets updated and applied"
+            else
+                print_success "VLAN subnets saved (will apply when traversal is enabled)"
+            fi
+            ;;
+        0)
+            return
+            ;;
+    esac
+
+    echo ""
+    read -p "Press Enter to continue..."
 }
 
 configure_coturn_menu() {
@@ -1397,13 +1504,27 @@ generate_pjsip_conf() {
     local conf_file="/etc/asterisk/pjsip.conf"
     backup_config "$conf_file"
     
-    # NAT settings only for FQDN mode
+    # NAT settings for FQDN mode or VLAN/NAT traversal
     local nat_settings=""
     if [[ "$FQDN_ENABLED" == "y" && -n "$CURRENT_PUBLIC_IP" ]]; then
         local local_net="${LOCAL_CIDR:-$(ip -o -f inet addr show | awk '/scope global/ {print $4}' | head -1)}"
         nat_settings="external_media_address=$CURRENT_PUBLIC_IP
 external_signaling_address=$CURRENT_PUBLIC_IP
 local_net=$local_net"
+    elif [[ "$VLAN_NAT_TRAVERSAL" == "y" ]]; then
+        # VLAN/NAT traversal without FQDN - configure local networks
+        local local_net="${LOCAL_CIDR:-$(ip -o -f inet addr show | awk '/scope global/ {print $4}' | head -1)}"
+        nat_settings="local_net=$local_net"
+
+        # Add user-configured VLAN subnets
+        if [[ -n "$VLAN_SUBNETS" ]]; then
+            IFS=',' read -ra SUBNETS <<< "$VLAN_SUBNETS"
+            for subnet in "${SUBNETS[@]}"; do
+                subnet=$(echo "$subnet" | xargs)  # trim whitespace
+                [[ -n "$subnet" ]] && nat_settings="${nat_settings}
+local_net=$subnet"
+            done
+        fi
     fi
 
     cat > "$conf_file" << EOF
@@ -2085,6 +2206,7 @@ submenu_server() {
     echo "  5) Configure COTURN"
     echo "  6) Restart Asterisk"
     echo "  7) Watch SIP traffic"
+    echo "  8) VLAN/NAT traversal"
     echo "  0) Back"
     read -p "  Select: " choice
     case $choice in
@@ -2095,6 +2217,7 @@ submenu_server() {
         5) configure_coturn_menu ;;
         6) restart_asterisk_safe ;;
         7) watch_sip_traffic ;;
+        8) toggle_vlan_nat_traversal ;;
         0) return ;;
     esac
     [[ "$choice" != "0" ]] && read -p "Press Enter..."
