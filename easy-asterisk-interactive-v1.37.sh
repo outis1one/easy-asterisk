@@ -1,6 +1,11 @@
 #!/bin/bash
 # ================================================================
-# Easy Asterisk - Interactive Installer v1.37.1
+# Easy Asterisk - Interactive Installer v1.37.2
+#
+# CRITICAL FIX in v1.37.2:
+# - FIXED: Stasis disabled causing Asterisk to fail on startup
+#   Stasis is REQUIRED in Asterisk 20.x - was being disabled with ARI/HTTP
+#   Now only disables optional modules: ari, http, manager, geolocation
 #
 # BUG FIXES in v1.37.1:
 # - FIXED: Function name bug (rebuild_pjsip_config → generate_pjsip_conf)
@@ -47,7 +52,7 @@ PTT_CONFIG_FILE="${CONFIG_DIR}/ptt-device"
 CATEGORIES_FILE="${CONFIG_DIR}/categories.conf"
 ROOMS_FILE="${CONFIG_DIR}/rooms.conf"
 COTURN_CONFIG="/etc/turnserver.conf"
-SCRIPT_VERSION="1.37.1"
+SCRIPT_VERSION="1.37.2"
 
 # ================================================================
 # 1. CORE HELPER FUNCTIONS
@@ -1475,10 +1480,17 @@ load => app_dial.so
 load => app_page.so
 load => pbx_config.so
 EOF
-    
-    for conf in stasis ari http manager geolocation; do
+
+    # Disable optional modules (NOT stasis - it's required in Asterisk 20.x)
+    for conf in ari http manager geolocation; do
         echo -e "[general]\nenabled = no" > "/etc/asterisk/${conf}.conf"
     done
+
+    # Configure Stasis properly (required core module)
+    cat > /etc/asterisk/stasis.conf << EOF
+[general]
+; Stasis is required for Asterisk 20.x core functionality
+EOF
 
     load_config
     local ice_config="# ICE disabled - LAN only"
