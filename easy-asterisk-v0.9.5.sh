@@ -2660,18 +2660,309 @@ submenu_devices() {
     [[ "$choice" != "0" ]] && submenu_devices
 }
 
+export_clients() {
+    print_header "Export Client Configurations"
+    load_config
+    initialize_default_categories
+
+    # Create export directory
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local export_dir="/tmp/asterisk_export_${timestamp}"
+    local export_file="/root/asterisk-clients-${timestamp}.tar.gz"
+
+    mkdir -p "$export_dir"
+
+    # Check if there are any devices to export
+    if ! grep -q "^; === Device:" /etc/asterisk/pjsip.conf 2>/dev/null; then
+        print_error "No client devices found to export"
+        rm -rf "$export_dir"
+        return
+    fi
+
+    # Export devices from pjsip.conf (everything after transport definitions)
+    echo "Extracting client devices..."
+    awk '/^; === Device:/{flag=1} flag' /etc/asterisk/pjsip.conf > "$export_dir/devices.conf"
+
+    # Count devices
+    local device_count=$(grep -c "^; === Device:" "$export_dir/devices.conf")
+
+    # Export categories
+    if [[ -f "$CATEGORIES_FILE" ]]; then
+        echo "Exporting categories..."
+        cp "$CATEGORIES_FILE" "$export_dir/categories.conf"
+    fi
+
+    # Export rooms
+    if [[ -f "$ROOMS_FILE" ]]; then
+        echo "Exporting rooms..."
+        cp "$ROOMS_FILE" "$export_dir/rooms.conf"
+    fi
+
+    # Create metadata file
+    cat > "$export_dir/export_info.txt" << EOF
+Easy Asterisk Client Export
+Export Date: $(date)
+Device Count: $device_count
+Domain: ${DOMAIN_NAME:-Not configured}
+TLS Enabled: ${ENABLE_TLS:-no}
+Exported by: $(whoami)
+Hostname: $(hostname)
+EOF
+
+    # Create tar.gz archive
+    echo "Creating archive..."
+    tar -czf "$export_file" -C /tmp "asterisk_export_${timestamp}" 2>/dev/null
+
+    # Cleanup temp directory
+    rm -rf "$export_dir"
+
+    if [[ -f "$export_file" ]]; then
+        print_success "Export completed successfully!"
+        echo ""
+        echo "  Exported: $device_count devices"
+        echo "  File: $export_file"
+        echo "  Size: $(du -h "$export_file" | cut -f1)"
+        echo ""
+        echo "  To import on another system:"
+        echo "  1) Copy file to the target server"
+        echo "  2) Run Easy Asterisk"
+        echo "  3) Select 'Client Settings' -> 'Import Clients'"
+    else
+        print_error "Export failed"
+    fi
+}
+
+import_clients() {
+    print_header "Import Client Configurations"
+    load_config
+    initialize_default_categories
+
+    echo "Available export files in /root:"
+    local files=($(ls -t /root/asterisk-clients-*.tar.gz 2>/dev/null))
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        echo ""
+        read -p "Enter full path to export file: " import_file
+    else
+        echo ""
+        local i=1
+        for f in "${files[@]}"; do
+            echo "  $i) $(basename "$f") - $(du -h "$f" | cut -f1) - $(date -r "$f" '+%Y-%m-%d %H:%M')"
+            ((i++))
+        done
+        echo "  0) Enter custom path"
+        echo ""
+        read -p "Select file [1]: " file_choice
+        file_choice="${file_choice:-1}"
+
+        if [[ "$file_choice" == "0" ]]; then
+            read -p "Enter full path to export file: " import_file
+        elif [[ "$file_choice" -ge 1 && "$file_choice" -le ${#files[@]} ]]; then
+            import_file="${files[$((file_choice-1))]}"
+        else
+            print_error "Invalid selection"
+            return
+        fi
+    fi
+
+    if [[ ! -f "$import_file" ]]; then
+        print_error "File not found: $import_file"
+        return
+    fi
+
+    # Extract to temp directory
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local import_dir="/tmp/asterisk_import_${timestamp}"
+    mkdir -p "$import_dir"
+
+    echo "Extracting archive..."
+    tar -xzf "$import_file" -C "$import_dir" 2>/dev/null
+
+    # Find the extracted directory
+    local extract_dir=$(find "$import_dir" -type d -name "asterisk_export_*" | head -1)
+    if [[ ! -d "$extract_dir" ]]; then
+        print_error "Invalid export file format"
+        rm -rf "$import_dir"
+        return
+    fi
+
+    # Show export info
+    if [[ -f "$extract_dir/export_info.txt" ]]; then
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        cat "$extract_dir/export_info.txt"
+        echo "═══════════════════════════════════════════════════════════════"
+        echo ""
+    fi
+
+    # Count devices to import
+    local device_count=0
+    if [[ -f "$extract_dir/devices.conf" ]]; then
+        device_count=$(grep -c "^; === Device:" "$extract_dir/devices.conf")
+    fi
+
+    if [[ $device_count -eq 0 ]]; then
+        print_error "No devices found in export file"
+        rm -rf "$import_dir"
+        return
+    fi
+
+    echo "This will import $device_count device(s)."
+    echo ""
+    read -p "Import mode [1=Merge, 2=Replace All]: " import_mode
+    import_mode="${import_mode:-1}"
+
+    if [[ "$import_mode" == "2" ]]; then
+        echo ""
+        echo "${RED}WARNING: This will DELETE ALL existing devices!${NC}"
+        read -p "Type 'DELETE ALL' to confirm: " confirm
+        if [[ "$confirm" != "DELETE ALL" ]]; then
+            print_error "Import cancelled"
+            rm -rf "$import_dir"
+            return
+        fi
+    fi
+
+    # Backup existing configurations
+    echo "Backing up current configuration..."
+    backup_config "/etc/asterisk/pjsip.conf"
+    backup_config "$CATEGORIES_FILE"
+    backup_config "$ROOMS_FILE"
+
+    # Import devices
+    if [[ "$import_mode" == "2" ]]; then
+        # Replace mode - remove all existing devices
+        echo "Removing existing devices..."
+        local temp_pjsip="/tmp/pjsip_base_${timestamp}.conf"
+        awk '/^; === Device:/{exit} {print}' /etc/asterisk/pjsip.conf > "$temp_pjsip"
+        cat "$temp_pjsip" "$extract_dir/devices.conf" > /etc/asterisk/pjsip.conf
+        rm -f "$temp_pjsip"
+        print_success "Replaced all devices with imported devices"
+    else
+        # Merge mode - check for conflicts
+        echo "Checking for extension conflicts..."
+        local conflicts=0
+        local conflict_list=""
+
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^\[([0-9]+)\]$ ]]; then
+                local ext="${BASH_REMATCH[1]}"
+                if grep -q "^\[${ext}\]" /etc/asterisk/pjsip.conf 2>/dev/null; then
+                    conflicts=$((conflicts + 1))
+                    conflict_list="${conflict_list}${ext} "
+                fi
+            fi
+        done < "$extract_dir/devices.conf"
+
+        if [[ $conflicts -gt 0 ]]; then
+            echo ""
+            echo "${YELLOW}Warning: Found $conflicts conflicting extension(s): $conflict_list${NC}"
+            read -p "Skip conflicting devices? [Y/n]: " skip_conflicts
+            skip_conflicts="${skip_conflicts:-Y}"
+
+            if [[ ! "$skip_conflicts" =~ ^[Yy]$ ]]; then
+                print_error "Import cancelled"
+                rm -rf "$import_dir"
+                return
+            fi
+
+            # Import only non-conflicting devices
+            echo "Importing non-conflicting devices..."
+            local temp_import="/tmp/import_filtered_${timestamp}.conf"
+            local skip_device=0
+
+            while IFS= read -r line; do
+                if [[ "$line" == "; === Device:"* ]]; then
+                    skip_device=0
+                    echo "$line" >> "$temp_import"
+                elif [[ "$line" =~ ^\[([0-9]+)\]$ ]]; then
+                    local ext="${BASH_REMATCH[1]}"
+                    if grep -q "^\[${ext}\]" /etc/asterisk/pjsip.conf 2>/dev/null; then
+                        skip_device=1
+                        echo "  Skipping extension $ext (already exists)"
+                    else
+                        echo "$line" >> "$temp_import"
+                    fi
+                elif [[ $skip_device -eq 0 ]]; then
+                    echo "$line" >> "$temp_import"
+                fi
+            done < "$extract_dir/devices.conf"
+
+            cat "$temp_import" >> /etc/asterisk/pjsip.conf
+            rm -f "$temp_import"
+        else
+            # No conflicts, import all
+            echo "No conflicts found, importing all devices..."
+            cat "$extract_dir/devices.conf" >> /etc/asterisk/pjsip.conf
+        fi
+
+        print_success "Devices imported successfully"
+    fi
+
+    # Import categories (merge, skip duplicates)
+    if [[ -f "$extract_dir/categories.conf" ]]; then
+        echo "Importing categories..."
+        while IFS='|' read -r cat_id cat_name auto_answer description; do
+            [[ "$cat_id" =~ ^# ]] && continue
+            [[ -z "$cat_id" ]] && continue
+
+            # Skip if already exists
+            if grep -q "^${cat_id}|" "$CATEGORIES_FILE" 2>/dev/null; then
+                echo "  Skipping category '$cat_id' (already exists)"
+            else
+                echo "${cat_id}|${cat_name}|${auto_answer}|${description}" >> "$CATEGORIES_FILE"
+                echo "  Imported category: $cat_name"
+            fi
+        done < "$extract_dir/categories.conf"
+    fi
+
+    # Import rooms (merge, skip duplicates)
+    if [[ -f "$extract_dir/rooms.conf" ]]; then
+        echo "Importing rooms..."
+        while IFS='|' read -r ext name members timeout type; do
+            [[ "$ext" =~ ^# ]] && continue
+            [[ -z "$ext" ]] && continue
+
+            # Skip if already exists
+            if grep -q "^${ext}|" "$ROOMS_FILE" 2>/dev/null; then
+                echo "  Skipping room '$name' (extension $ext already exists)"
+            else
+                echo "${ext}|${name}|${members}|${timeout}|${type}" >> "$ROOMS_FILE"
+                echo "  Imported room: $name (ext $ext)"
+            fi
+        done < "$extract_dir/rooms.conf"
+    fi
+
+    # Cleanup
+    rm -rf "$import_dir"
+
+    # Reload Asterisk
+    echo ""
+    echo "Reloading Asterisk configuration..."
+    asterisk -rx "pjsip reload" >/dev/null 2>&1
+    rebuild_dialplan quiet
+
+    print_success "Import completed successfully!"
+    echo ""
+    echo "  Run 'List devices' to verify imported clients"
+}
+
 submenu_client() {
     clear
     print_header "Client Settings"
     echo "  1) Configure Local Client"
     echo "  2) Configure PTT Button"
     echo "  3) Run Diagnostics"
+    echo "  4) Export Clients"
+    echo "  5) Import Clients"
     echo "  0) Back"
     read -p "  Select: " choice
     case $choice in
         1) configure_local_client ;;
         2) configure_ptt_menu ;;
         3) run_client_diagnostics ;;
+        4) export_clients ;;
+        5) import_clients ;;
         0) return ;;
     esac
     [[ "$choice" != "0" ]] && read -p "Press Enter..."
