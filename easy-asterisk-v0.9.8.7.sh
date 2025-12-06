@@ -1,13 +1,11 @@
 #!/bin/bash
 # ================================================================
-# Easy Asterisk - Interactive Installer v0.9.8.7
+# Easy Asterisk - Interactive Installer v0.9.8
 #
-# UPDATES in v0.9.8.7
-# - FEATURE: ADDED: Ability to rename categories and rooms
-# - FIXED: Categories not displaying correctly in lists of devices
-
 # UPDATES in v0.9.8:
+# - FIXED: Categories not displaying correctly in lists of devices
 # - ADDED: Client export/import functionality in Device Management menu
+# - FEATURE: ADDED: Ability to rename categories and rooms
 # - FEATURE: Export all provisioned clients to tar.gz archive
 # - FEATURE: Import clients with merge or replace modes
 # - FEATURE: Automatic conflict detection and resolution during import
