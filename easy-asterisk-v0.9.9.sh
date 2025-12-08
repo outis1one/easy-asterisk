@@ -1629,6 +1629,15 @@ create_linphone_xml() {
     <entry name="android_push_notification">0</entry>
     <!-- CRITICAL: Prevent audio pause when screen turns off -->
     <entry name="android_pause_calls_when_audio_focus_lost">0</entry>
+    <!-- /e/OS and privacy ROMs: Keep service alive -->
+    <entry name="keep_service_alive">1</entry>
+    <entry name="start_at_boot">1</entry>
+  </section>
+
+  <section name="audio">
+    <!-- Force audio routing for background operation -->
+    <entry name="audio_route_earpiece">0</entry>
+    <entry name="audio_route_speaker">1</entry>
   </section>
 
   <section name="net">
@@ -1655,6 +1664,9 @@ EOF
         echo "  2. Replace USERNAME and PASSWORD in device-specific XML files"
         echo "  3. Set Battery Optimization to 'Unrestricted' manually on phone"
         echo "  4. The XML prevents audio pause when screen turns off"
+        echo ""
+        echo "FOR /e/OS (eFoundation) users:"
+        echo "  See 'Troubleshoot /e/OS Audio' in Provisioning Manager menu"
     fi
 }
 
@@ -1715,6 +1727,112 @@ show_provisioning_status() {
     echo "  HTTPS: https://${server_ip}:8089/static/"
 }
 
+troubleshoot_eos_audio() {
+    print_header "/e/OS Audio Troubleshooting"
+
+    cat << 'EOSHELP'
+PROBLEM: No audio sent by phone unless Linphone has focus
+═══════════════════════════════════════════════════════════
+
+This is a known issue with /e/OS (eFoundation OS) and privacy-focused
+Android ROMs. /e/OS has stricter privacy controls that prevent apps
+from accessing the microphone in the background.
+
+SOLUTIONS (Try in order):
+
+1. LINPHONE APP SETTINGS (In Linphone app itself):
+   ────────────────────────────────────────────────────
+   a) Open Linphone → ☰ Menu → Settings → Audio
+   b) Change "Audio Route" to "Speaker" (not Earpiece)
+   c) Enable "Use Speaker for calls"
+   d) Disable "Echo Cancellation" (test if this helps)
+   e) Go to Settings → Network
+   f) Set "Media Encryption" to "None" (or match server)
+
+2. /e/OS PRIVACY SETTINGS:
+   ────────────────────────────────────────────────────
+   a) Settings → Apps → Linphone
+   b) Permissions → Microphone → "Allow all the time"
+   c) Permissions → Camera → "Don't allow" (if not using video)
+   d) "Remove permissions if app isn't used" → DISABLE
+
+3. /e/OS ADVANCED PRIVACY SETTINGS:
+   ────────────────────────────────────────────────────
+   a) Settings → Privacy (Advanced Privacy / Privacy Central)
+   b) Find Linphone in the list
+   c) Disable "Hide my IP" for Linphone
+   d) Set Location to "Real" (not fake location)
+   e) Disable any "Manage trackers" restrictions for Linphone
+
+4. /e/OS NETWORK PERMISSIONS:
+   ────────────────────────────────────────────────────
+   a) Settings → Apps → Linphone → Mobile data & Wi-Fi
+   b) Enable "Background data"
+   c) Enable "Unrestricted data usage"
+   d) Make sure "Allow network access" is ON
+
+5. /e/OS AUTOSTART:
+   ────────────────────────────────────────────────────
+   a) Settings → Apps → Linphone → Battery
+   b) Battery optimization → "Don't optimize" or "Unrestricted"
+   c) Settings → Apps → Linphone → Advanced
+   d) Enable "Autostart" if available
+
+6. LINPHONE XML PROVISIONING (Server-side fix):
+   ────────────────────────────────────────────────────
+   Your linphone.xml should already have these settings:
+   • android_pause_calls_when_audio_focus_lost=0
+   • keep_service_alive=1
+   • start_at_boot=1
+   • audio_route_speaker=1
+
+   To verify, check: $PROVISIONING_DIR/linphone.xml
+
+7. ALTERNATIVE: USE SPEAKER MODE DURING CALL:
+   ────────────────────────────────────────────────────
+   As a workaround, during an active call:
+   • Tap the speaker icon to enable speakerphone
+   • This often forces audio to work even in background
+   • Not ideal but proves the audio path works
+
+8. NUCLEAR OPTION - DISABLE PRIVACY FEATURES:
+   ────────────────────────────────────────────────────
+   If nothing works, temporarily disable /e/OS privacy features:
+   a) Settings → Privacy → Advanced Privacy
+   b) Toggle OFF "Advanced Privacy"
+   c) Test if Linphone audio works
+   d) If it works, re-enable and whitelist Linphone
+
+9. ALTERNATIVE SIP APP:
+   ────────────────────────────────────────────────────
+   If Linphone continues to have issues on /e/OS, try:
+   • Zoiper (better /e/OS compatibility)
+   • CSipSimple (older but reliable)
+   • Grandstream Wave (commercial but works well)
+
+TESTING:
+════════
+1. Make a call with Linphone in foreground → audio works
+2. Press Home button → does audio continue?
+3. If audio stops, the issue is confirmed
+
+WHAT'S HAPPENING:
+═════════════════
+/e/OS restricts background microphone access for privacy.
+Even with permissions granted, the OS may suspend audio
+capture when the app loses focus. The XML settings and
+speaker mode help work around this limitation.
+
+MORE HELP:
+══════════
+• /e/OS Community: https://community.e.foundation
+• Linphone Forums: https://forum.linphone.org
+• Issue: "Background microphone access on /e/OS"
+
+═══════════════════════════════════════════════════════════
+EOSHELP
+}
+
 provisioning_manager_menu() {
     while true; do
         clear
@@ -1724,6 +1842,7 @@ provisioning_manager_menu() {
         echo "  3) Edit linphone.xml"
         echo "  4) Show Status"
         echo "  5) Open Provisioning Directory"
+        echo "  6) Troubleshoot /e/OS Audio Issues"
         echo "  0) Back"
         read -p "  Select: " choice
 
@@ -1740,6 +1859,7 @@ provisioning_manager_menu() {
                     ls -lah "$PROVISIONING_DIR"
                 fi
                 ;;
+            6) troubleshoot_eos_audio ;;
             0) return ;;
         esac
 
