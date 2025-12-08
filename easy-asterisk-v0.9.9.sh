@@ -1,23 +1,25 @@
 #!/bin/bash
 # ================================================================
-# Easy Asterisk - Interactive Installer v0.9.8
+# Easy Asterisk - Interactive Installer v0.9.9
 #
-# UPDATES in v0.9.8:
+# Copyright (C) 2025 Easy Asterisk Contributors
+# Licensed under GNU General Public License v3.0
+# See LICENSE file or https://www.gnu.org/licenses/gpl-3.0.html
+#
+# UPDATES in v0.9.9:
+# - REMOVED: All COTURN/TURN relay server code (focus on direct connections)
+# - ADDED: VLAN subnet configuration to prevent 30-second call drops
+# - ADDED: Provisioning Manager (http.conf setup, symlinks, linphone.xml editor)
+# - ADDED: Manual Update System for Asterisk with backup/rollback
+# - ADDED: Room Directory (visual display of Ring Groups vs Page Groups)
+# - ADDED: Split-horizon DNS documentation for VLAN environments
+# - IMPROVED: Server IP address documented in transport configurations
+# - IMPROVED: Multiple local_net entries for proper VLAN support
+#
+# PREVIOUS UPDATES (v0.9.8):
 # - FIXED: Categories not displaying correctly in lists of devices
 # - ADDED: Client export/import functionality in Device Management menu
-# - FEATURE: ADDED: Ability to rename categories and rooms
-# - FEATURE: Export all provisioned clients to tar.gz archive
-# - FEATURE: Import clients with merge or replace modes
-# - FEATURE: Automatic conflict detection and resolution during import
-# - FEATURE: Backup protection before import operations
-#
-# RETAINED from v0.9.5:
-# - FIXED: Stasis disabled causing startup failure (now only disables optional modules)
-# - ADDED: Automatic VLAN/NAT traversal (works with flat, VPN, and VLAN networks)
-# - ADDED: Per-device connection type selection (LAN/VPN vs FQDN)
-# - IMPROVED: Transport-level NAT configuration for better VLAN support
-# - IMPROVED: Generic router references (not brand-specific)
-# - COMPATIBLE: Works with flat networks, VLANs, VPNs, and FQDN modes
+# - ADDED: Ability to rename categories and rooms
 # ================================================================
 
 set +e
@@ -33,14 +35,13 @@ NC='\033[0m'
 # Defaults
 DEFAULT_SIP_PORT="5060"
 DEFAULT_SIPS_PORT="5061"
-DEFAULT_TURN_PORT="3478"
 CONFIG_DIR="/etc/easy-asterisk"
 CONFIG_FILE="${CONFIG_DIR}/config"
 PTT_CONFIG_FILE="${CONFIG_DIR}/ptt-device"
 CATEGORIES_FILE="${CONFIG_DIR}/categories.conf"
 ROOMS_FILE="${CONFIG_DIR}/rooms.conf"
-COTURN_CONFIG="/etc/turnserver.conf"
-SCRIPT_VERSION="0.9.8.8"
+PROVISIONING_DIR="/var/lib/asterisk/static-http"
+SCRIPT_VERSION="0.9.9"
 
 # ================================================================
 # 1. CORE HELPER FUNCTIONS
@@ -148,14 +149,8 @@ load_config() {
     fi
     INSTALLED_SERVER="${INSTALLED_SERVER:-n}"
     INSTALLED_CLIENT="${INSTALLED_CLIENT:-n}"
-    INSTALLED_COTURN="${INSTALLED_COTURN:-n}"
     KIOSK_USER="${KIOSK_USER:-}"
     KIOSK_UID="${KIOSK_UID:-}"
-    USE_COTURN="${USE_COTURN:-n}"
-    TURN_SECRET="${TURN_SECRET:-}"
-    TURN_USER="${TURN_USER:-kioskuser}"
-    TURN_PASS="${TURN_PASS:-}"
-    TURN_DOMAIN="${TURN_DOMAIN:-}"
     HAS_VLANS="${HAS_VLANS:-n}"
     VLAN_SUBNETS="${VLAN_SUBNETS:-}"
     return 0
@@ -182,7 +177,6 @@ KIOSK_NAME="$KIOSK_NAME"
 SIP_PASSWORD="$SIP_PASSWORD"
 ASTERISK_HOST="$ASTERISK_HOST"
 DOMAIN_NAME="$DOMAIN_NAME"
-TURN_DOMAIN="$TURN_DOMAIN"
 ENABLE_TLS="$ENABLE_TLS"
 HAS_VLANS="$HAS_VLANS"
 VLAN_SUBNETS="$VLAN_SUBNETS"
@@ -190,11 +184,6 @@ CERT_PATH="$CERT_PATH"
 KEY_PATH="$KEY_PATH"
 INSTALLED_SERVER="$INSTALLED_SERVER"
 INSTALLED_CLIENT="$INSTALLED_CLIENT"
-INSTALLED_COTURN="$INSTALLED_COTURN"
-USE_COTURN="$USE_COTURN"
-TURN_SECRET="$TURN_SECRET"
-TURN_USER="$TURN_USER"
-TURN_PASS="$TURN_PASS"
 CURRENT_PUBLIC_IP="$CURRENT_PUBLIC_IP"
 PTT_DEVICE="$PTT_DEVICE"
 PTT_KEYCODE="$PTT_KEYCODE"
@@ -219,12 +208,8 @@ open_firewall_ports() {
             ufw allow 5060/udp comment "SIP UDP" 2>/dev/null || true
             ufw allow 5061/tcp comment "SIP TLS" 2>/dev/null || true
             ufw allow 10000:20000/udp comment "RTP Media" 2>/dev/null || true
-            if [[ "$USE_COTURN" == "y" ]]; then
-                ufw allow ${DEFAULT_TURN_PORT}/udp comment "TURN UDP" 2>/dev/null || true
-                ufw allow ${DEFAULT_TURN_PORT}/tcp comment "TURN TCP" 2>/dev/null || true
-                # Allow relay range for TURN
-                ufw allow 49152:65535/udp comment "TURN Relay" 2>/dev/null || true
-            fi
+            ufw allow 8088/tcp comment "HTTP Provisioning" 2>/dev/null || true
+            ufw allow 8089/tcp comment "HTTPS Provisioning" 2>/dev/null || true
             ufw reload 2>/dev/null || true
             print_success "UFW firewall ports opened"
         fi
@@ -232,268 +217,12 @@ open_firewall_ports() {
 }
 
 # ================================================================
-# 2. COTURN SETUP & DYNAMIC IP
+# 2. UTILITY FUNCTIONS
 # ================================================================
 
 get_public_ip() {
     local ip=$(curl -s -4 --connect-timeout 5 ifconfig.me 2>/dev/null || curl -s -4 --connect-timeout 5 icanhazip.com 2>/dev/null || echo "")
     echo "$ip"
-}
-
-install_coturn() {
-    print_header "Installing COTURN"
-    apt update
-    apt install -y coturn
-    
-    if [[ -z "$TURN_PASS" ]]; then
-        TURN_PASS=$(generate_password)
-    fi
-    
-    local public_ip=$(get_public_ip)
-    CURRENT_PUBLIC_IP="$public_ip"
-    
-    if [[ -z "$public_ip" ]]; then
-        print_error "Could not detect public IP"
-        return 1
-    fi
-    
-    print_info "Public IP: $public_ip"
-    
-    # Enable coturn
-    sed -i 's/#TURNSERVER_ENABLED=1/TURNSERVER_ENABLED=1/' /etc/default/coturn 2>/dev/null || true
-    
-    # Configure coturn
-    backup_config "$COTURN_CONFIG"
-    cat > "$COTURN_CONFIG" << EOF
-# Easy Asterisk COTURN Configuration
-listening-port=${DEFAULT_TURN_PORT}
-fingerprint
-lt-cred-mech
-realm=${TURN_DOMAIN:-${DOMAIN_NAME:-turn.local}}
-total-quota=100
-stale-nonce=600
-cert=/etc/asterisk/certs/server.crt
-pkey=/etc/asterisk/certs/server.key
-no-tlsv1
-no-tlsv1_1
-cipher-list="ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384"
-dh2066
-no-stdout-log
-log-file=/var/log/turnserver.log
-simple-log
-external-ip=${public_ip}
-min-port=49152
-max-port=65535
-user-quota=12
-no-multicast-peers
-no-cli
-user=${TURN_USER}:${TURN_PASS}
-EOF
-
-    chmod 600 "$COTURN_CONFIG"
-    
-    systemctl enable coturn
-    systemctl restart coturn
-    
-    if systemctl is-active coturn >/dev/null; then
-        print_success "COTURN installed and running"
-        INSTALLED_COTURN="y"
-        USE_COTURN="y"
-        save_config
-        return 0
-    else
-        print_error "COTURN failed to start"
-        journalctl -u coturn -n 20 --no-pager
-        return 1
-    fi
-}
-
-configure_coturn_credentials() {
-    print_header "Configure TURN Credentials"
-    echo "Current User: ${TURN_USER}"
-    echo "Current Pass: ${TURN_PASS}"
-    echo ""
-    read -p "Enter Username [${TURN_USER}]: " t_user
-    t_user="${t_user:-$TURN_USER}"
-    read -p "Enter Password [generate]: " t_pass
-    t_pass="${t_pass:-$(generate_password)}"
-    
-    TURN_USER="$t_user"
-    TURN_PASS="$t_pass"
-    
-    if [[ -f "$COTURN_CONFIG" ]]; then
-        # Remove old user lines and add new one
-        sed -i '/^user=/d' "$COTURN_CONFIG"
-        echo "user=${TURN_USER}:${TURN_PASS}" >> "$COTURN_CONFIG"
-        systemctl restart coturn
-        print_success "Credentials updated and service restarted"
-    else
-        print_error "COTURN not installed. Run install first."
-    fi
-    save_config
-}
-
-update_coturn_ip() {
-    local new_ip=$(get_public_ip)
-    
-    if [[ -z "$new_ip" ]]; then
-        print_warn "Could not detect public IP"
-        return 1
-    fi
-    
-    if [[ "$new_ip" == "$CURRENT_PUBLIC_IP" ]]; then
-        print_info "IP unchanged: $new_ip"
-        return 0
-    fi
-    
-    print_info "IP changed: $CURRENT_PUBLIC_IP -> $new_ip"
-    
-    # Update coturn config
-    if [[ -f "$COTURN_CONFIG" ]]; then
-        sed -i "s/^external-ip=.*/external-ip=${new_ip}/" "$COTURN_CONFIG"
-        systemctl restart coturn
-        print_success "COTURN updated"
-    fi
-    
-    # Update pjsip config
-    if [[ -f /etc/asterisk/pjsip.conf ]]; then
-        sed -i "s/^external_media_address=.*/external_media_address=${new_ip}/" /etc/asterisk/pjsip.conf
-        sed -i "s/^external_signaling_address=.*/external_signaling_address=${new_ip}/" /etc/asterisk/pjsip.conf
-        asterisk -rx "pjsip reload" 2>/dev/null
-        print_success "Asterisk updated"
-    fi
-    
-    CURRENT_PUBLIC_IP="$new_ip"
-    save_config
-    return 0
-}
-
-create_ip_update_script() {
-    cat > /usr/local/bin/easy-asterisk-update-ip << 'IPSCRIPT'
-#!/bin/bash
-CONFIG_FILE="/etc/easy-asterisk/config"
-[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
-
-get_public_ip() {
-    curl -s -4 --connect-timeout 5 ifconfig.me 2>/dev/null || curl -s -4 --connect-timeout 5 icanhazip.com 2>/dev/null
-}
-
-NEW_IP=$(get_public_ip)
-[[ -z "$NEW_IP" ]] && exit 0
-[[ "$NEW_IP" == "$CURRENT_PUBLIC_IP" ]] && exit 0
-
-# Update COTURN
-if [[ -f /etc/turnserver.conf ]]; then
-    sed -i "s/^external-ip=.*/external-ip=${NEW_IP}/" /etc/turnserver.conf
-    systemctl restart coturn
-fi
-
-# Update Asterisk
-if [[ -f /etc/asterisk/pjsip.conf ]]; then
-    sed -i "s/^external_media_address=.*/external_media_address=${NEW_IP}/" /etc/asterisk/pjsip.conf
-    sed -i "s/^external_signaling_address=.*/external_signaling_address=${NEW_IP}/" /etc/asterisk/pjsip.conf
-    asterisk -rx "pjsip reload" 2>/dev/null
-fi
-
-# Update config file
-sed -i "s/^CURRENT_PUBLIC_IP=.*/CURRENT_PUBLIC_IP=\"${NEW_IP}\"/" "$CONFIG_FILE"
-
-logger "Easy Asterisk: Updated IP to ${NEW_IP}"
-IPSCRIPT
-    chmod +x /usr/local/bin/easy-asterisk-update-ip
-    
-    # Create systemd timer
-    cat > /etc/systemd/system/easy-asterisk-ip-update.service << 'EOF'
-[Unit]
-Description=Easy Asterisk IP Update
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/easy-asterisk-update-ip
-EOF
-
-    cat > /etc/systemd/system/easy-asterisk-ip-update.timer << 'EOF'
-[Unit]
-Description=Easy Asterisk IP Update Timer
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=10min
-
-[Install]
-WantedBy=timers.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable easy-asterisk-ip-update.timer
-    systemctl start easy-asterisk-ip-update.timer
-    
-    print_success "IP update timer installed (checks every 10 minutes)"
-}
-
-configure_coturn_menu() {
-    print_header "Configure COTURN (TURN Server)"
-    
-    if [[ "$INSTALLED_COTURN" == "y" ]]; then
-        echo -e "Status: ${GREEN}Installed${NC}"
-        echo "User:   ${TURN_USER}"
-        echo "Pass:   ${TURN_PASS}"
-        echo ""
-        echo "  1) Update Credentials (User/Pass)"
-        echo "  2) Reinstall/Reconfigure"
-        echo "  3) Update IP manually"
-        echo "  4) Show configuration"
-        echo "  5) Uninstall"
-        echo "  0) Back"
-        read -p "Select: " choice
-        case $choice in
-            1) configure_coturn_credentials ;;
-            2) install_coturn ;;
-            3) update_coturn_ip ;;
-            4) show_coturn_config ;;
-            5) uninstall_coturn ;;
-        esac
-    else
-        echo "COTURN is not installed."
-        read -p "Install now? [Y/n]: " install
-        if [[ ! "$install" =~ ^[Nn]$ ]]; then
-            install_coturn
-            if [[ "$INSTALLED_COTURN" == "y" ]]; then
-                create_ip_update_script
-            fi
-        fi
-    fi
-}
-
-show_coturn_config() {
-    print_header "COTURN Configuration"
-    echo "Status: $(systemctl is-active coturn)"
-    echo "Public IP: $CURRENT_PUBLIC_IP"
-    echo "Port: ${DEFAULT_TURN_PORT}"
-    echo "Credentials: ${TURN_USER} : ${TURN_PASS}"
-    echo ""
-    echo "Client Config String:"
-    echo "turn:${TURN_USER}:${TURN_PASS}@${TURN_DOMAIN:-${DOMAIN_NAME:-$CURRENT_PUBLIC_IP}}:${DEFAULT_TURN_PORT}"
-    echo ""
-    echo "Logs:"
-    tail -n 20 /var/log/turnserver.log 2>/dev/null || echo "  No logs found"
-}
-
-uninstall_coturn() {
-    systemctl stop coturn 2>/dev/null || true
-    systemctl disable coturn 2>/dev/null || true
-    apt purge -y coturn 2>/dev/null || true
-    rm -f /etc/turnserver.conf
-    rm -f /usr/local/bin/easy-asterisk-update-ip
-    systemctl stop easy-asterisk-ip-update.timer 2>/dev/null || true
-    systemctl disable easy-asterisk-ip-update.timer 2>/dev/null || true
-    rm -f /etc/systemd/system/easy-asterisk-ip-update.*
-    systemctl daemon-reload
-    INSTALLED_COTURN="n"
-    USE_COTURN="n"
-    save_config
-    print_success "COTURN uninstalled"
 }
 
 # ================================================================
@@ -1659,6 +1388,97 @@ configure_vlan_subnets() {
             generate_pjsip_conf
             asterisk -rx "module reload res_pjsip.so" 2>/dev/null
             print_success "Asterisk configuration updated"
+
+            echo ""
+            echo "═══════════════════════════════════════════════════════════"
+            echo "  VLAN DNS SETUP GUIDE (Split-Horizon)"
+            echo "═══════════════════════════════════════════════════════════"
+            echo ""
+            echo "For proper VLAN operation with FQDNs, you need split-horizon DNS."
+            echo ""
+            read -p "Display DNS setup guide? (y/n) [y]: " show_dns
+            show_dns=${show_dns:-y}
+
+            if [[ "$show_dns" =~ ^[Yy]$ ]]; then
+                cat << 'DNSGUIDE'
+
+WHAT YOU'RE ACHIEVING:
+• Devices on VLANs use router for DNS (ctrld)
+• ctrld split-horizon rules send FQDNs to the right LAN servers
+• Only ctrld (router) can talk to servers' DNS (protected by UFW)
+• No inter-VLAN routing is opened, just DNS and service ports
+
+1. CTRLD.TOML (on OPNSense/Router):
+
+[listener.0]
+  ip = '0.0.0.0'
+  port = 53
+
+  [listener.0.policy]
+    networks = [
+      { 'network.0' = ['upstream.0'] },
+      { 'network.1' = ['upstream.1'] }
+    ]
+    rules = [
+      { 'sip.mydomain.com' = ['upstream.4'] }
+    ]
+
+[network.0]
+  cidrs = ['192.168.1.0/24']
+
+[network.1]
+  cidrs = ['192.168.200.0/24']
+
+[upstream.0]
+  type = 'doh'
+  endpoint = 'https://dns.controld.com/your-profile'
+  timeout = 5000
+
+[upstream.4]
+  type = 'legacy'
+  endpoint = '192.168.1.11'   # This Asterisk server
+  timeout = 3000
+
+2. DNSMASQ ON THIS SERVER:
+
+sudo apt-get install dnsmasq
+echo "listen-address=127.0.0.1" >> /etc/dnsmasq.conf
+echo "listen-address=$(hostname -I | cut -d' ' -f1)" >> /etc/dnsmasq.conf
+echo "bind-interfaces" >> /etc/dnsmasq.conf
+echo "address=/sip.mydomain.com/$(hostname -I | cut -d' ' -f1)" >> /etc/dnsmasq.conf
+sudo systemctl restart dnsmasq
+
+3. UFW RULES ON THIS SERVER:
+
+sudo ufw allow from 192.168.1.1 to any port 53 proto udp
+sudo ufw allow from 192.168.1.1 to any port 53 proto tcp
+sudo ufw deny 53
+sudo ufw reload
+
+Replace 192.168.1.1 with your router's LAN IP.
+
+4. OPNSENSE FIREWALL RULES (for each VLAN):
+
+Rule 1 - Allow DNS from VLAN to Router:
+  Action: Pass
+  Source: VLANxx net
+  Destination: This Firewall
+  Port: 53 (DNS)
+  Protocol: TCP/UDP
+
+Rule 2 - Allow SIP/RTP from VLAN to Asterisk:
+  Source: VLANxx net
+  Destination: $(hostname -I | cut -d' ' -f1)
+  Ports: 5060/udp, 5061/tcp, 10000-20000/udp
+
+5. DHCP SETTINGS (OPNSense):
+
+For each VLAN, set DNS Servers to ONLY the router's VLAN IP.
+Do NOT enter this server's IP as DNS.
+
+═══════════════════════════════════════════════════════════
+DNSGUIDE
+            fi
         else
             print_error "No subnets provided"
         fi
@@ -1668,6 +1488,376 @@ configure_vlan_subnets() {
         save_config
         print_success "VLAN support disabled"
     fi
+}
+
+# ================================================================
+# PROVISIONING MANAGER
+# ================================================================
+
+setup_http_provisioning() {
+    print_header "HTTP Provisioning Setup"
+
+    echo "This will configure Asterisk's built-in HTTP server for"
+    echo "client provisioning (Linphone, etc.)."
+    echo ""
+    echo "Ports:"
+    echo "  HTTP:  8088"
+    echo "  HTTPS: 8089"
+    echo ""
+
+    # Create http.conf
+    backup_config "/etc/asterisk/http.conf" 2>/dev/null
+    cat > /etc/asterisk/http.conf << 'EOF'
+[general]
+enabled=yes
+bindaddr=0.0.0.0
+bindport=8088
+
+tlsenable=yes
+tlsbindaddr=0.0.0.0:8089
+tlscertfile=/etc/asterisk/certs/server.crt
+tlsprivatekey=/etc/asterisk/certs/server.key
+
+; Serve static files from /var/lib/asterisk/static-http
+enablestatic=yes
+redirect=/static /var/lib/asterisk/static-http
+
+; Security
+session_limit=100
+session_inactivity=30000
+session_keep_alive=15000
+EOF
+
+    chown asterisk:asterisk /etc/asterisk/http.conf
+
+    # Create provisioning directory
+    mkdir -p "$PROVISIONING_DIR"
+    chown asterisk:asterisk "$PROVISIONING_DIR"
+
+    # Create symlink if needed (Ubuntu/Debian fix)
+    if [[ ! -L /usr/share/asterisk/static-http ]]; then
+        mkdir -p /usr/share/asterisk
+        ln -sf "$PROVISIONING_DIR" /usr/share/asterisk/static-http
+        print_info "Created symlink: /usr/share/asterisk/static-http -> $PROVISIONING_DIR"
+    fi
+
+    # Reload Asterisk HTTP module
+    asterisk -rx "module reload res_http_post.so" 2>/dev/null || true
+    asterisk -rx "http show status" 2>/dev/null
+
+    print_success "HTTP provisioning configured"
+    echo ""
+    echo "Access provisioning files at:"
+    echo "  HTTP:  http://$(hostname -I | cut -d' ' -f1):8088/static/"
+    echo "  HTTPS: https://$(hostname -I | cut -d' ' -f1):8089/static/"
+}
+
+create_linphone_xml() {
+    print_header "Create/Edit Linphone Provisioning XML"
+    load_config
+
+    local xml_file="$PROVISIONING_DIR/linphone.xml"
+    local server_ip=$(hostname -I | cut -d' ' -f1)
+    local domain="${DOMAIN_NAME:-$server_ip}"
+    local transport="tcp"
+
+    if [[ "$ENABLE_TLS" == "y" && -n "$DOMAIN_NAME" ]]; then
+        transport="tls"
+    fi
+
+    echo "Current Configuration:"
+    echo "  Domain:    $domain"
+    echo "  Transport: $transport"
+    echo "  Server IP: $server_ip"
+    echo ""
+
+    read -p "Create/Update linphone.xml? (y/n) [y]: " create_xml
+    create_xml=${create_xml:-y}
+
+    if [[ "$create_xml" =~ ^[Yy]$ ]]; then
+        mkdir -p "$PROVISIONING_DIR"
+
+        cat > "$xml_file" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<config xmlns="http://www.linphone.org/xsds/lpconfig.xsd"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.linphone.org/xsds/lpconfig.xsd lpconfig.xsd">
+
+  <!-- Easy Asterisk Provisioning -->
+
+  <section name="sip">
+    <entry name="default_proxy">0</entry>
+    <entry name="register_only_when_network_is_up">1</entry>
+    <entry name="ping_with_options">0</entry>
+  </section>
+
+  <section name="proxy_0">
+    <entry name="reg_proxy">&lt;sip:${domain};transport=${transport}&gt;</entry>
+    <entry name="reg_identity">sip:USERNAME@${domain}</entry>
+    <entry name="reg_expires">3600</entry>
+    <entry name="publish">0</entry>
+    <entry name="dial_escape_plus">0</entry>
+  </section>
+
+  <section name="auth_info_0">
+    <entry name="username">USERNAME</entry>
+    <entry name="passwd">PASSWORD</entry>
+    <entry name="realm">${domain}</entry>
+  </section>
+
+  <section name="rtp">
+    <entry name="audio_rtp_port">7078</entry>
+    <entry name="audio_jitt_comp">60</entry>
+  </section>
+
+  <section name="sound">
+    <entry name="playback_dev_id">ANDROID SND: Android Sound card</entry>
+    <entry name="capture_dev_id">ANDROID SND: Android Sound card</entry>
+    <entry name="media_dev_id">ANDROID SND: Android Sound card</entry>
+  </section>
+
+  <section name="video">
+    <entry name="enabled">0</entry>
+    <entry name="automatically_initiate">0</entry>
+    <entry name="automatically_accept">0</entry>
+  </section>
+
+  <section name="app">
+    <entry name="auto_start">1</entry>
+    <entry name="show_contacts_emails_preference">0</entry>
+    <entry name="android_app_use_opensl">1</entry>
+    <entry name="android_push_notification">0</entry>
+    <!-- CRITICAL: Prevent audio pause when screen turns off -->
+    <entry name="android_pause_calls_when_audio_focus_lost">0</entry>
+  </section>
+
+  <section name="net">
+    <entry name="mtu">1300</entry>
+  </section>
+
+</config>
+EOF
+
+        chown asterisk:asterisk "$xml_file"
+        chmod 644 "$xml_file"
+
+        print_success "Created: $xml_file"
+        echo ""
+        echo "Provisioning URL:"
+        if [[ "$transport" == "tls" ]]; then
+            echo "  https://${domain}:8089/static/linphone.xml"
+        else
+            echo "  http://${server_ip}:8088/static/linphone.xml"
+        fi
+        echo ""
+        echo "IMPORTANT for Android:"
+        echo "  1. Use the URL above in Linphone's 'Remote provisioning'"
+        echo "  2. Replace USERNAME and PASSWORD in device-specific XML files"
+        echo "  3. Set Battery Optimization to 'Unrestricted' manually on phone"
+        echo "  4. The XML prevents audio pause when screen turns off"
+    fi
+}
+
+edit_linphone_xml() {
+    local xml_file="$PROVISIONING_DIR/linphone.xml"
+
+    if [[ ! -f "$xml_file" ]]; then
+        print_error "linphone.xml does not exist. Create it first."
+        return 1
+    fi
+
+    print_header "Edit Linphone XML"
+    echo "Opening in nano editor..."
+    echo "Press Ctrl+X to save and exit"
+    echo ""
+    read -p "Press Enter to continue..."
+
+    nano "$xml_file"
+
+    print_success "Changes saved"
+}
+
+show_provisioning_status() {
+    print_header "Provisioning Status"
+
+    # Check HTTP configuration
+    if [[ -f /etc/asterisk/http.conf ]] && grep -q "enabled=yes" /etc/asterisk/http.conf 2>/dev/null; then
+        echo -e "HTTP Server: ${GREEN}Enabled${NC}"
+        asterisk -rx "http show status" 2>/dev/null | head -10
+    else
+        echo -e "HTTP Server: ${RED}Disabled${NC}"
+    fi
+
+    echo ""
+
+    # Check provisioning directory
+    if [[ -d "$PROVISIONING_DIR" ]]; then
+        echo -e "Provisioning Dir: ${GREEN}$PROVISIONING_DIR${NC}"
+        echo "Files:"
+        ls -lh "$PROVISIONING_DIR" 2>/dev/null | tail -n +2 || echo "  (empty)"
+    else
+        echo -e "Provisioning Dir: ${RED}Not created${NC}"
+    fi
+
+    echo ""
+
+    # Check symlink
+    if [[ -L /usr/share/asterisk/static-http ]]; then
+        echo -e "Symlink: ${GREEN}OK${NC} (/usr/share/asterisk/static-http)"
+    else
+        echo -e "Symlink: ${YELLOW}Not created${NC}"
+    fi
+
+    echo ""
+    local server_ip=$(hostname -I | cut -d' ' -f1)
+    echo "Provisioning URLs:"
+    echo "  HTTP:  http://${server_ip}:8088/static/"
+    echo "  HTTPS: https://${server_ip}:8089/static/"
+}
+
+provisioning_manager_menu() {
+    while true; do
+        clear
+        print_header "Provisioning Manager"
+        echo "  1) Setup HTTP Server (ports 8088/8089)"
+        echo "  2) Create/Update linphone.xml"
+        echo "  3) Edit linphone.xml"
+        echo "  4) Show Status"
+        echo "  5) Open Provisioning Directory"
+        echo "  0) Back"
+        read -p "  Select: " choice
+
+        case $choice in
+            1) setup_http_provisioning ;;
+            2) create_linphone_xml ;;
+            3) edit_linphone_xml ;;
+            4) show_provisioning_status ;;
+            5)
+                if command -v mc &>/dev/null; then
+                    mc "$PROVISIONING_DIR"
+                else
+                    print_info "Opening with ls..."
+                    ls -lah "$PROVISIONING_DIR"
+                fi
+                ;;
+            0) return ;;
+        esac
+
+        [[ "$choice" != "0" ]] && read -p "Press Enter..."
+    done
+}
+
+# ================================================================
+# MANUAL UPDATE SYSTEM
+# ================================================================
+
+manual_update_asterisk() {
+    print_header "Manual Asterisk Update"
+    echo "WARNING: This will update Asterisk from the repository."
+    echo "A backup will be created automatically."
+    echo ""
+    asterisk -V 2>/dev/null || echo "Asterisk not currently running"
+    echo ""
+    read -p "Continue with update? (y/n) [n]: " confirm
+    confirm=${confirm:-n}
+
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        print_info "Update cancelled"
+        return
+    fi
+
+    # Backup configurations
+    local backup_dir="/root/asterisk-backup-$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$backup_dir"
+    echo "Creating backup in $backup_dir..."
+    cp -r /etc/asterisk "$backup_dir/"
+    cp -r /var/lib/asterisk "$backup_dir/" 2>/dev/null || true
+
+    print_success "Backup created: $backup_dir"
+
+    # Update
+    echo ""
+    print_info "Updating Asterisk..."
+    apt update
+    apt install --only-upgrade asterisk asterisk-modules -y
+
+    # Restart
+    echo ""
+    print_info "Restarting Asterisk..."
+    systemctl restart asterisk
+
+    sleep 3
+
+    if systemctl is-active asterisk >/dev/null; then
+        print_success "Asterisk updated successfully"
+        asterisk -V
+        echo ""
+        echo "Backup location: $backup_dir"
+        echo ""
+        echo "To rollback if needed:"
+        echo "  systemctl stop asterisk"
+        echo "  cp -r $backup_dir/asterisk/* /etc/asterisk/"
+        echo "  systemctl start asterisk"
+    else
+        print_error "Asterisk failed to start after update!"
+        echo ""
+        echo "Rolling back..."
+        cp -r "$backup_dir/asterisk/"* /etc/asterisk/
+        systemctl restart asterisk
+        print_info "Rollback complete"
+    fi
+}
+
+# ================================================================
+# ROOM DIRECTORY
+# ================================================================
+
+show_room_directory() {
+    print_header "Room Directory"
+    load_config
+
+    if [[ ! -f "$ROOMS_FILE" ]]; then
+        print_error "Rooms file not found: $ROOMS_FILE"
+        return
+    fi
+
+    echo "Ring Groups vs Page Groups:"
+    echo "  • Ring Groups: Rings all members until one answers"
+    echo "  • Page Groups: Auto-answer broadcast to all members"
+    echo ""
+    echo "═══════════════════════════════════════════════════════════"
+
+    local has_rooms=false
+    while IFS='|' read -r ext name members timeout type; do
+        # Skip comments and empty lines
+        [[ "$ext" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$ext" ]] && continue
+
+        has_rooms=true
+
+        # Determine icon based on type
+        local icon="📞"
+        local type_label="Ring Group"
+        if [[ "$type" == "page" ]]; then
+            icon="📢"
+            type_label="Page Group"
+        fi
+
+        echo ""
+        echo "$icon Extension: $ext - $name"
+        echo "   Type: $type_label"
+        echo "   Members: $members"
+        echo "   Timeout: ${timeout}s"
+    done < "$ROOMS_FILE"
+
+    if [[ "$has_rooms" == "false" ]]; then
+        echo ""
+        echo "No rooms configured yet."
+        echo "Use 'Device Management → Manage rooms' to create rooms."
+    fi
+
+    echo ""
+    echo "═══════════════════════════════════════════════════════════"
 }
 
 watch_live_logs() {
@@ -3007,8 +3197,8 @@ submenu_server() {
     echo "  6) Verify CIDR/NAT config"
     echo "  7) Watch Live Logs"
     echo "  8) Router Doctor"
-    echo "  9) Configure TURN Server (COTURN)"
-    echo " 10) Configure VLAN Subnets"
+    echo "  9) Configure VLAN Subnets"
+    echo " 10) Provisioning Manager"
     echo "  0) Back"
     read -p "  Select: " choice
     case $choice in
@@ -3020,8 +3210,8 @@ submenu_server() {
         6) verify_cidr_config ;;
         7) watch_live_logs ;;
         8) router_doctor ;;
-        9) configure_coturn_menu ;;
-        10) configure_vlan_subnets ;;
+        9) configure_vlan_subnets ;;
+        10) provisioning_manager_menu ;;
         0) return ;;
     esac
     [[ "$choice" != "0" ]] && read -p "Press Enter..."
@@ -3405,12 +3595,16 @@ submenu_tools() {
     echo "  1) Audio Test"
     echo "  2) Verify Audio/Codec Setup"
     echo "  3) Fix Audio (Unmute & Restart)"
+    echo "  4) Room Directory"
+    echo "  5) Manual Update Asterisk"
     echo "  0) Back"
     read -p "  Select: " choice
     case $choice in
         1) run_audio_test ;;
         2) verify_audio_setup ;;
         3) fix_audio_manually ;;
+        4) show_room_directory ;;
+        5) manual_update_asterisk ;;
         0) return ;;
     esac
     [[ "$choice" != "0" ]] && read -p "Press Enter..."
