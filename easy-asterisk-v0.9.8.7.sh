@@ -40,7 +40,7 @@ PTT_CONFIG_FILE="${CONFIG_DIR}/ptt-device"
 CATEGORIES_FILE="${CONFIG_DIR}/categories.conf"
 ROOMS_FILE="${CONFIG_DIR}/rooms.conf"
 COTURN_CONFIG="/etc/turnserver.conf"
-SCRIPT_VERSION="0.9.5"
+SCRIPT_VERSION="0.9.8.8"
 
 # ================================================================
 # 1. CORE HELPER FUNCTIONS
@@ -156,6 +156,8 @@ load_config() {
     TURN_USER="${TURN_USER:-kioskuser}"
     TURN_PASS="${TURN_PASS:-}"
     TURN_DOMAIN="${TURN_DOMAIN:-}"
+    HAS_VLANS="${HAS_VLANS:-n}"
+    VLAN_SUBNETS="${VLAN_SUBNETS:-}"
     return 0
 }
 
@@ -182,6 +184,8 @@ ASTERISK_HOST="$ASTERISK_HOST"
 DOMAIN_NAME="$DOMAIN_NAME"
 TURN_DOMAIN="$TURN_DOMAIN"
 ENABLE_TLS="$ENABLE_TLS"
+HAS_VLANS="$HAS_VLANS"
+VLAN_SUBNETS="$VLAN_SUBNETS"
 CERT_PATH="$CERT_PATH"
 KEY_PATH="$KEY_PATH"
 INSTALLED_SERVER="$INSTALLED_SERVER"
@@ -1615,6 +1619,57 @@ verify_cidr_config() {
     grep -E "external_|local_net" /etc/asterisk/pjsip.conf 2>/dev/null || echo "  No NAT settings found"
 }
 
+configure_vlan_subnets() {
+    print_header "VLAN Configuration"
+    load_config
+
+    echo "VLAN Support for Asterisk Easy"
+    echo "================================================"
+    echo ""
+    echo "If your network uses VLANs (Virtual LANs), you need to"
+    echo "tell Asterisk about all the local subnets to prevent"
+    echo "calls from dropping after 30 seconds."
+    echo ""
+    echo "Example subnets:"
+    echo "  192.168.1.0/24    - Main network"
+    echo "  192.168.10.0/24   - IoT VLAN"
+    echo "  192.168.20.0/24   - Guest VLAN"
+    echo "  10.0.0.0/8        - Large private network"
+    echo ""
+
+    read -p "Does your network use VLANs? (y/n) [${HAS_VLANS}]: " has_vlans
+    has_vlans=${has_vlans:-$HAS_VLANS}
+
+    if [[ "$has_vlans" =~ ^[Yy] ]]; then
+        HAS_VLANS="y"
+        echo ""
+        echo "Current VLAN Subnets: ${VLAN_SUBNETS:-none}"
+        echo ""
+        echo "Enter VLAN subnets in CIDR notation, separated by spaces."
+        echo "Example: 192.168.1.0/24 192.168.10.0/24 192.168.20.0/24"
+        echo ""
+        read -p "VLAN Subnets: " vlan_input
+
+        if [[ -n "$vlan_input" ]]; then
+            VLAN_SUBNETS="$vlan_input"
+            save_config
+            print_success "VLAN configuration saved"
+            echo ""
+            echo "Rebuilding pjsip.conf to apply changes..."
+            generate_pjsip_conf
+            asterisk -rx "module reload res_pjsip.so" 2>/dev/null
+            print_success "Asterisk configuration updated"
+        else
+            print_error "No subnets provided"
+        fi
+    else
+        HAS_VLANS="n"
+        VLAN_SUBNETS=""
+        save_config
+        print_success "VLAN support disabled"
+    fi
+}
+
 watch_live_logs() {
     print_header "Live Debugging"
     echo "Enabling PJSIP Logger..."
@@ -2066,19 +2121,32 @@ generate_pjsip_conf() {
         public_ip=$(curl -s -4 --connect-timeout 5 ifconfig.me 2>/dev/null || echo "")
     fi
     
+    # Get server IP for transport binding info
+    local server_ip=$(hostname -I | cut -d' ' -f1)
+
     local raw_cidr=$(ip -o -f inet addr show | awk '/scope global/ {print $4}' | head -1)
     local default_cidr="$raw_cidr"
     if [[ "$raw_cidr" =~ \.([0-9]+)/24$ ]]; then default_cidr="${raw_cidr%.*}.0/24"; fi
-    
+
     # Use stored CIDR if available
     local local_net="${LOCAL_CIDR:-$default_cidr}"
-    
+
+    # Build local_net entries (main network + VLANs)
+    local all_local_nets="local_net=$local_net"
+    if [[ "$HAS_VLANS" == "y" && -n "$VLAN_SUBNETS" ]]; then
+        for vlan_subnet in $VLAN_SUBNETS; do
+            all_local_nets="${all_local_nets}
+local_net=${vlan_subnet}"
+        done
+        print_info "VLAN subnets configured: $VLAN_SUBNETS"
+    fi
+
     local nat_settings=""
     if [[ -n "$public_ip" && -n "$DOMAIN_NAME" ]]; then
         nat_settings="external_media_address=$public_ip
 external_signaling_address=$public_ip
-local_net=$local_net"
-        print_info "NAT: Public IP=$public_ip, Local=$local_net"
+${all_local_nets}"
+        print_info "NAT: Public IP=$public_ip, Server IP=$server_ip"
     fi
 
     cat > "$conf_file" << EOF
@@ -2091,18 +2159,21 @@ user_agent=EasyAsterisk
 type=transport
 protocol=udp
 bind=0.0.0.0:${DEFAULT_SIP_PORT}
+; Server IP: ${server_ip}
 ${nat_settings}
 
 [transport-tcp]
 type=transport
 protocol=tcp
 bind=0.0.0.0:${DEFAULT_SIP_PORT}
+; Server IP: ${server_ip}
 ${nat_settings}
 
 [transport-tls]
 type=transport
 protocol=tls
 bind=0.0.0.0:${DEFAULT_SIPS_PORT}
+; Server IP: ${server_ip}
 cert_file=/etc/asterisk/certs/server.crt
 priv_key_file=/etc/asterisk/certs/server.key
 ca_list_file=/etc/ssl/certs/ca-certificates.crt
@@ -2937,6 +3008,7 @@ submenu_server() {
     echo "  7) Watch Live Logs"
     echo "  8) Router Doctor"
     echo "  9) Configure TURN Server (COTURN)"
+    echo " 10) Configure VLAN Subnets"
     echo "  0) Back"
     read -p "  Select: " choice
     case $choice in
@@ -2949,6 +3021,7 @@ submenu_server() {
         7) watch_live_logs ;;
         8) router_doctor ;;
         9) configure_coturn_menu ;;
+        10) configure_vlan_subnets ;;
         0) return ;;
     esac
     [[ "$choice" != "0" ]] && read -p "Press Enter..."
