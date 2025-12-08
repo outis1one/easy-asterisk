@@ -2460,7 +2460,7 @@ ${all_local_nets}"
     fi
 
     cat > "$conf_file" << EOF
-; Easy Asterisk v1.23
+; Easy Asterisk v0.9.9
 [global]
 type=global
 user_agent=EasyAsterisk
@@ -3255,14 +3255,13 @@ uninstall_menu() {
 
 show_main_menu() {
     clear
-    print_header "Easy Asterisk v1.23"
-    
+    print_header "Easy Asterisk v0.9.9"
+
     load_config
     echo "  Status:"
     if [[ -f "$CONFIG_FILE" ]]; then
         [[ "$INSTALLED_SERVER" == "y" ]] && echo -e "    Server: ${GREEN}Installed${NC}" || echo -e "    Server: ${YELLOW}Not installed${NC}"
         [[ "$INSTALLED_CLIENT" == "y" ]] && echo -e "    Client: ${GREEN}Installed${NC}" || echo -e "    Client: ${YELLOW}Not installed${NC}"
-        [[ "$INSTALLED_COTURN" == "y" ]] && echo -e "    COTURN: ${GREEN}Installed${NC}" || echo -e "    COTURN: ${YELLOW}Not installed${NC}"
         [[ -n "$DOMAIN_NAME" ]] && echo -e "    Domain: ${DOMAIN_NAME}"
     else
         echo -e "    ${YELLOW}Not configured${NC}"
