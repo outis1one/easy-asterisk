@@ -672,18 +672,83 @@ EOF
     asterisk -rx "pjsip reload" >/dev/null 2>&1
     rebuild_dialplan
 
+    # Prepare provisioning URLs if HTTP server is configured
+    local server_ip=$(hostname -I | awk '{print $1}')
+    local prov_url_http=""
+    local prov_url_https=""
+    if [[ -f /etc/asterisk/http.conf ]] && grep -q "enabled=yes" /etc/asterisk/http.conf 2>/dev/null; then
+        prov_url_http="http://${server_ip}:8088/static/linphone.xml"
+        if [[ -n "$DOMAIN_NAME" ]]; then
+            prov_url_https="https://${DOMAIN_NAME}:8089/static/linphone.xml"
+        fi
+    fi
+
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
-    echo "  DEVICE ADDED"
+    echo "  DEVICE ADDED: $name (Extension $ext)"
     echo "═══════════════════════════════════════════════════════════════"
     echo ""
-    echo -e "  ${BOLD}Client Configuration:${NC}"
+    echo -e "  ${BOLD}Server Details:${NC}"
     echo "  Server:     ${display_server}"
     echo "  Port:       ${display_port}"
     echo "  Transport:  ${display_transport}"
     echo "  Extension:  $ext"
     echo "  Password:   $pass"
     echo "  Encryption: ${display_encryption}"
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo -e "  ${BOLD}LINPHONE SETUP${NC}"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+    if [[ -n "$prov_url_http" ]]; then
+        echo "  Remote Provisioning (Recommended):"
+        echo "  1. In Linphone → Settings → Remote provisioning"
+        echo "  2. Enter URL:"
+        echo "     ${prov_url_http}"
+        [[ -n "$prov_url_https" ]] && echo "     OR ${prov_url_https}"
+        echo "  3. Tap 'Fetch' to apply configuration"
+        echo ""
+        echo "  OR Manual Setup:"
+    else
+        echo "  Manual Setup:"
+    fi
+    echo "  1. Add Account → Use SIP account"
+    echo "  2. Username: $ext"
+    echo "  3. Password: $pass"
+    echo "  4. Domain: ${display_server}"
+    echo "  5. Transport: ${display_transport}"
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo -e "  ${BOLD}BARESIP SETUP (if Linphone has audio issues)${NC}"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+    echo "  Baresip often works better on privacy-focused Android ROMs."
+    echo "  Two-step manual configuration required:"
+    echo ""
+    echo "  Step 1: Add Account"
+    echo "    Menu (☰) → Accounts → Add (+)"
+    echo "    SIP URI: ${ext}@${display_server}"
+    echo "    Save (✓)"
+    echo ""
+    echo "  Step 2: Edit Account (Complete Config)"
+    echo "    Tap account → Edit"
+    echo "    Auth Username: $ext (JUST the number!)"
+    echo "    Auth Password: $pass"
+    echo "    Outbound Proxy: ${display_server} (JUST the domain!)"
+    echo "    Media Encryption: srtp (select from dropdown)"
+    echo "    Register: ✓ (check box)"
+    echo "    Save (✓)"
+    echo ""
+    echo "  Verify: Look for green dot or 'Registered' status"
+    echo "  To call: Just dial extension (101, 202, etc.)"
+    echo ""
+    echo "  For detailed Baresip instructions:"
+    echo "  Server Settings → Provisioning Manager → Create Baresip Config"
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+    echo "  NOTE: These instructions work for most SIP apps (Zoiper,"
+    echo "        sipnetic, etc.) - just use the same credentials."
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
 }
@@ -1420,7 +1485,7 @@ WHAT YOU'RE ACHIEVING:
       { 'network.1' = ['upstream.1'] }
     ]
     rules = [
-      { 'sip.mydomain.com' = ['upstream.4'] }
+      { 'asterisk.mydomain.com' = ['upstream.4'] }
     ]
 
 [network.0]
@@ -1445,7 +1510,7 @@ sudo apt-get install dnsmasq
 echo "listen-address=127.0.0.1" >> /etc/dnsmasq.conf
 echo "listen-address=$(hostname -I | cut -d' ' -f1)" >> /etc/dnsmasq.conf
 echo "bind-interfaces" >> /etc/dnsmasq.conf
-echo "address=/sip.mydomain.com/$(hostname -I | cut -d' ' -f1)" >> /etc/dnsmasq.conf
+echo "address=/asterisk.mydomain.com/$(hostname -I | cut -d' ' -f1)" >> /etc/dnsmasq.conf
 sudo systemctl restart dnsmasq
 
 3. UFW RULES ON THIS SERVER:
