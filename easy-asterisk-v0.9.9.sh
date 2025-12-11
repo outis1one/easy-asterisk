@@ -3512,6 +3512,8 @@ install_asterisk_packages() {
     update-ca-certificates 2>/dev/null || true
     rm -f /usr/sbin/policy-rc.d
     fix_asterisk_systemd
+    systemctl enable asterisk
+    systemctl start asterisk
 }
 
 install_baresip_packages() {
