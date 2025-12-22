@@ -162,6 +162,7 @@ load_config() {
     KIOSK_UID="${KIOSK_UID:-}"
     HAS_VLANS="${HAS_VLANS:-n}"
     VLAN_SUBNETS="${VLAN_SUBNETS:-}"
+    WEB_ADMIN_PORT="${WEB_ADMIN_PORT:-8080}"
     return 0
 }
 
@@ -197,6 +198,7 @@ CURRENT_PUBLIC_IP="$CURRENT_PUBLIC_IP"
 PTT_DEVICE="$PTT_DEVICE"
 PTT_KEYCODE="$PTT_KEYCODE"
 LOCAL_CIDR="$LOCAL_CIDR"
+WEB_ADMIN_PORT="$WEB_ADMIN_PORT"
 EOF
     chmod 644 "$CONFIG_FILE"
 
@@ -3693,7 +3695,7 @@ submenu_install() {
 # WEB ADMIN INTERFACE
 # ================================================================
 
-WEB_ADMIN_PORT="8080"
+# WEB_ADMIN_PORT is set in load_config (default: 8080)
 WEB_ADMIN_SCRIPT="/usr/local/bin/easy-asterisk-webadmin"
 WEB_ADMIN_SERVICE="/etc/systemd/system/easy-asterisk-webadmin.service"
 WEB_ADMIN_HTPASSWD="/etc/easy-asterisk/webadmin.htpasswd"
@@ -3779,31 +3781,16 @@ def get_devices():
     with open(PJSIP_CONF, 'r') as f:
         content = f.read()
 
-    device_pattern = re.compile(
-        r'; === Device: ([^(]+)\(([^)]+)\)\s*(\[AA:(yes|no)\])?\s*===\s*\n'
-        r'\[(\d+)\]\s*\n'
-        r'type=endpoint\s*\n'
-        r'(?:.*?\n)*?'
-        r'(?:transport=transport-(\w+))?\s*\n?'
-        r'(?:.*?\n)*?'
-        r'(?:media_encryption=(\w+))?\s*\n?'
-        r'(?:.*?\n)*?'
-        r'\[\5\]\s*\n'
-        r'type=auth\s*\n'
-        r'(?:.*?\n)*?'
-        r'password=(\S+)',
-        re.MULTILINE
-    )
-
-    # Simpler parsing approach
+    # Parse devices using a state machine approach
     current_device = None
-    in_endpoint = False
+    current_ext = None
 
     for line in content.split('\n'):
         line = line.strip()
 
+        # Match device comment line (handles variable spacing before ===)
         if line.startswith('; === Device:'):
-            match = re.match(r'; === Device: (.+?) \((\w+)\)\s*(\[AA:(yes|no)\])?\s*===', line)
+            match = re.match(r'; === Device:\s*(.+?)\s*\((\w+)\)\s*(\[AA:(yes|no)\])?\s*===', line)
             if match:
                 current_device = {
                     'name': match.group(1).strip(),
@@ -3814,25 +3801,30 @@ def get_devices():
                     'transport': 'udp',
                     'encryption': 'no'
                 }
+                current_ext = None
 
+        # Match extension section header
         elif current_device and re.match(r'^\[(\d{3})\]$', line):
             ext = re.match(r'^\[(\d{3})\]$', line).group(1)
             if current_device['extension'] is None:
                 current_device['extension'] = ext
-                in_endpoint = True
+                current_ext = ext
+            elif ext == current_ext:
+                # Same extension, could be auth or aor section
+                pass
 
-        elif current_device and in_endpoint:
+        # Parse properties within sections
+        elif current_device and current_ext:
             if line.startswith('transport=transport-'):
                 current_device['transport'] = line.split('-')[1]
             elif line.startswith('media_encryption='):
                 current_device['encryption'] = line.split('=')[1]
             elif line.startswith('password='):
                 current_device['password'] = line.split('=')[1]
+                # Found password, device is complete
                 devices.append(current_device)
                 current_device = None
-                in_endpoint = False
-            elif line == '' or line.startswith('['):
-                in_endpoint = False
+                current_ext = None
 
     return devices
 
@@ -4710,6 +4702,7 @@ web_admin_menu() {
             new_port="${new_port:-$WEB_ADMIN_PORT}"
             if [[ "$new_port" =~ ^[0-9]+$ ]] && [[ "$new_port" -ge 1024 ]] && [[ "$new_port" -le 65535 ]]; then
                 WEB_ADMIN_PORT="$new_port"
+                save_config
                 create_web_admin_service
                 systemctl restart easy-asterisk-webadmin 2>/dev/null
                 print_success "Port changed to $new_port"
