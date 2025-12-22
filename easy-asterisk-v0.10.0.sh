@@ -1,12 +1,26 @@
 #!/bin/bash
 # ================================================================
-# Easy Asterisk - Interactive Installer v0.9.9
+# Easy Asterisk - Interactive Installer v0.10.0
 #
 # Copyright (C) 2025 Easy Asterisk Contributors
 # Licensed under GNU General Public License v3.0
 # See LICENSE file or https://www.gnu.org/licenses/gpl-3.0.html
 #
-# UPDATES in v0.9.9:
+# UPDATES in v0.10.0:
+# - FIXED: Extension deletion now properly removes all sections (endpoint, auth, aor)
+# - FIXED: Extension renaming now preserves AA tags correctly
+# - FIXED: LAN/VPN devices now explicitly use UDP transport (prevents TLS fallback)
+# - FIXED: LAN devices now have media_encryption=no to prevent SRTP issues
+# - ADDED: Web Admin interface for browser-based client management
+#   - View device status (online/offline) in real-time
+#   - Add/delete devices via web interface
+#   - View rooms and categories
+#   - HTTP Basic authentication with SHA256 password hashing
+#   - Access at http://server:8080/clients
+# - IMPROVED: Device deletion uses awk for reliable multi-section removal
+# - IMPROVED: Device renaming uses awk to handle all edge cases
+#
+# PREVIOUS UPDATES (v0.9.9):
 # - REMOVED: All COTURN/TURN relay server code (focus on direct connections)
 # - ADDED: VLAN subnet configuration to prevent 30-second call drops
 # - ADDED: Provisioning Manager (http.conf setup, symlinks, linphone.xml editor)
@@ -15,11 +29,6 @@
 # - ADDED: Split-horizon DNS documentation for VLAN environments
 # - IMPROVED: Server IP address documented in transport configurations
 # - IMPROVED: Multiple local_net entries for proper VLAN support
-#
-# PREVIOUS UPDATES (v0.9.8):
-# - FIXED: Categories not displaying correctly in lists of devices
-# - ADDED: Client export/import functionality in Device Management menu
-# - ADDED: Ability to rename categories and rooms
 # ================================================================
 
 set +e
@@ -41,7 +50,7 @@ PTT_CONFIG_FILE="${CONFIG_DIR}/ptt-device"
 CATEGORIES_FILE="${CONFIG_DIR}/categories.conf"
 ROOMS_FILE="${CONFIG_DIR}/rooms.conf"
 PROVISIONING_DIR="/var/lib/asterisk/static-http"
-SCRIPT_VERSION="0.9.9"
+SCRIPT_VERSION="0.10.0"
 
 # ================================================================
 # 1. CORE HELPER FUNCTIONS
@@ -612,7 +621,9 @@ add_device_menu() {
     conn_choice="${conn_choice:-1}"
 
     if [[ "$conn_choice" == "1" ]]; then
-        # LAN/VPN - UDP, no encryption
+        # LAN/VPN - UDP, no encryption (explicit transport prevents TLS fallback)
+        transport_block="transport=transport-udp"
+        encryption_block="media_encryption=no"
         display_server="$(hostname -I | awk '{print $1}')"
         display_port="5060"
         display_transport="UDP"
@@ -640,6 +651,7 @@ add_device_menu() {
 [${ext}]
 type=endpoint
 context=intercom
+${transport_block}
 disallow=all
 allow=opus
 allow=ulaw
@@ -756,24 +768,25 @@ EOF
 remove_device() {
     print_header "Remove Device"
     declare -A REMOVE_MAP
+    declare -A NAME_MAP
     local count=1
+    local current_name=""
     echo "Select device to remove:"
     echo ""
     while IFS= read -r line; do
         if [[ "$line" == *"; === Device:"* ]]; then
             local temp="${line#*; === Device: }"
             temp="${temp% ===}"
-            temp="${temp% \[AA:*\]}" 
-            local name="${temp% (*)}"
+            temp="${temp% \[AA:*\]}"
+            current_name="${temp% (*)}"
         fi
-        if [[ "$line" =~ ^\[([0-9]+)\] ]]; then
+        if [[ "$line" =~ ^\[([0-9]+)\]$ && "$current_name" != "" ]]; then
             local ext="${BASH_REMATCH[1]}"
-            if [[ -n "$name" ]]; then
-                echo "  ${count}) Ext ${ext} - ${name}"
-                REMOVE_MAP[$count]=$ext
-                ((count++))
-                name=""
-            fi
+            echo "  ${count}) Ext ${ext} - ${current_name}"
+            REMOVE_MAP[$count]=$ext
+            NAME_MAP[$count]="$current_name"
+            ((count++))
+            current_name=""
         fi
     done < /etc/asterisk/pjsip.conf
     echo ""
@@ -781,16 +794,23 @@ remove_device() {
     echo "  0) Cancel"
     echo ""
     read -p "Select: " choice
-    
+
     if [[ "$choice" == "98" ]]; then
         echo ""
         print_warn "This will DELETE ALL DEVICES!"
         read -p "Type 'DELETE ALL' to confirm: " confirm
         if [[ "$confirm" == "DELETE ALL" ]]; then
             backup_config "/etc/asterisk/pjsip.conf"
-            # Remove all device sections
-            sed -i '/^; === Device:/,/^$/d' /etc/asterisk/pjsip.conf
-            sed -i '/^\[[0-9]\{3\}\]/,/^$/d' /etc/asterisk/pjsip.conf
+            # Remove all device sections - use awk to properly handle all sections
+            awk '
+                /^; === Device:/ { skip = 1; next }
+                /^\[[0-9]{3}\]$/ { if (skip) next }
+                /^type=(endpoint|auth|aor)/ { if (skip) next }
+                /^$/ { if (skip) { skip = 0; next } }
+                !skip { print }
+            ' /etc/asterisk/pjsip.conf > /etc/asterisk/pjsip.conf.tmp
+            mv /etc/asterisk/pjsip.conf.tmp /etc/asterisk/pjsip.conf
+            chown asterisk:asterisk /etc/asterisk/pjsip.conf
             asterisk -rx "pjsip reload" 2>/dev/null
             rebuild_dialplan
             print_success "All devices deleted"
@@ -799,18 +819,48 @@ remove_device() {
         fi
         return
     fi
-    
+
     [[ "$choice" == "0" || -z "${REMOVE_MAP[$choice]}" ]] && return
-    
+
     local ext="${REMOVE_MAP[$choice]}"
-    read -p "Confirm removal of $ext? [y/N]: " confirm
+    local name="${NAME_MAP[$choice]}"
+    read -p "Confirm removal of $ext ($name)? [y/N]: " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         backup_config "/etc/asterisk/pjsip.conf"
-        sed -i "/^; === Device:.*${ext}.*/,/^$/d" /etc/asterisk/pjsip.conf
-        sed -i "/^\[${ext}\]/,/^$/d" /etc/asterisk/pjsip.conf
+        # Use awk to remove the device comment and ALL three sections for this extension
+        awk -v ext="$ext" '
+            BEGIN { skip = 0; found_ext = 0 }
+            # Match device comment line - start potential skip
+            /^; === Device:/ { pending_comment = $0; next }
+            # Check if this is the extension we want to delete
+            $0 ~ "^\\[" ext "\\]$" {
+                if (pending_comment != "") {
+                    # This is our device - skip the comment and this section
+                    skip = 1
+                    found_ext = 1
+                    pending_comment = ""
+                    next
+                } else if (found_ext) {
+                    # Additional sections for same extension (auth, aor)
+                    skip = 1
+                    next
+                }
+            }
+            # If we have a pending comment for a different extension, print it
+            pending_comment != "" && $0 !~ "^\\[" ext "\\]$" {
+                print pending_comment
+                pending_comment = ""
+            }
+            # Skip lines until empty line
+            skip && /^$/ { skip = 0; next }
+            skip { next }
+            { print }
+        ' /etc/asterisk/pjsip.conf > /etc/asterisk/pjsip.conf.tmp
+        mv /etc/asterisk/pjsip.conf.tmp /etc/asterisk/pjsip.conf
+        chown asterisk:asterisk /etc/asterisk/pjsip.conf
         asterisk -rx "pjsip reload" 2>/dev/null
         rebuild_dialplan
-        print_success "Removed"
+        print_success "Removed extension $ext ($name)"
     fi
 }
  
@@ -818,6 +868,7 @@ rename_device() {
     print_header "Rename Device"
     declare -A DEVICE_MAP
     declare -A NAME_MAP
+    declare -A AA_MAP
     local count=1
     echo "Select device to rename:"
     echo ""
@@ -825,55 +876,80 @@ rename_device() {
         if [[ "$line" == *"; === Device:"* ]]; then
             local temp="${line#*; === Device: }"
             temp="${temp% ===}"
-            temp="${temp% \[AA:*\]}" 
+            local aa_tag=""
+            if [[ "$temp" == *"[AA:yes]"* ]]; then
+                aa_tag="[AA:yes]"
+                temp="${temp% \[AA:yes\]}"
+            elif [[ "$temp" == *"[AA:no]"* ]]; then
+                aa_tag="[AA:no]"
+                temp="${temp% \[AA:no\]}"
+            fi
             local name="${temp% (*)}"
             local cat="${temp##* (}"; cat="${cat%)}"
         fi
-        if [[ "$line" =~ ^\[([0-9]+)\] ]]; then
+        if [[ "$line" =~ ^\[([0-9]+)\]$ && -n "$name" ]]; then
             local ext="${BASH_REMATCH[1]}"
-            if [[ -n "$name" ]]; then
-                echo "  ${count}) Ext ${ext} - ${name} (${cat})"
-                DEVICE_MAP[$count]=$ext
-                NAME_MAP[$count]="${name}|${cat}"
-                ((count++))
-                name=""
-            fi
+            echo "  ${count}) Ext ${ext} - ${name} (${cat})"
+            DEVICE_MAP[$count]=$ext
+            NAME_MAP[$count]="${name}|${cat}"
+            AA_MAP[$count]="${aa_tag}"
+            ((count++))
+            name=""
         fi
     done < /etc/asterisk/pjsip.conf
     echo ""
     echo "  0) Cancel"
     echo ""
     read -p "Select: " choice
-    
+
     [[ "$choice" == "0" || -z "${DEVICE_MAP[$choice]}" ]] && return
-    
+
     local ext="${DEVICE_MAP[$choice]}"
     local info="${NAME_MAP[$choice]}"
+    local aa_tag="${AA_MAP[$choice]}"
     local old_name="${info%|*}"
     local cat="${info##*|}"
-    
+
     echo ""
     echo "Current name: ${old_name}"
     read -p "New name: " new_name
-    
+
     if [[ -z "$new_name" ]]; then
         print_error "Name cannot be empty"
         return
     fi
-    
+
     # Backup config
     backup_config "/etc/asterisk/pjsip.conf"
-    
-    # Update the device comment line
-    sed -i "s/^; === Device: ${old_name} (${cat})/; === Device: ${new_name} (${cat})/" /etc/asterisk/pjsip.conf
-    
-    # Update the callerid line
-    sed -i "/^\[${ext}\]/,/^$/ s/callerid=\"${old_name}\"/callerid=\"${new_name}\"/" /etc/asterisk/pjsip.conf
-    
+
+    # Use awk to properly update both the comment line (preserving AA tag) and callerid
+    awk -v ext="$ext" -v old_name="$old_name" -v new_name="$new_name" -v cat="$cat" -v aa_tag="$aa_tag" '
+        # Update device comment line
+        /^; === Device:/ && $0 ~ old_name && $0 ~ cat {
+            if (aa_tag != "") {
+                print "; === Device: " new_name " (" cat ") " aa_tag " ==="
+            } else {
+                print "; === Device: " new_name " (" cat ")  ==="
+            }
+            next
+        }
+        # Track when we are in the correct extension section
+        $0 ~ "^\\[" ext "\\]$" { in_ext = 1 }
+        /^$/ { in_ext = 0 }
+        # Update callerid in the extension section
+        in_ext && /^callerid=/ {
+            print "callerid=\"" new_name "\" <" ext ">"
+            next
+        }
+        { print }
+    ' /etc/asterisk/pjsip.conf > /etc/asterisk/pjsip.conf.tmp
+    mv /etc/asterisk/pjsip.conf.tmp /etc/asterisk/pjsip.conf
+    chown asterisk:asterisk /etc/asterisk/pjsip.conf
+
     # Reload Asterisk
     asterisk -rx "pjsip reload" 2>/dev/null
     rebuild_dialplan quiet
-    
+
     print_success "Device renamed: ${old_name} → ${new_name}"
 } 
 
@@ -3613,6 +3689,1041 @@ submenu_install() {
     esac
 }
 
+# ================================================================
+# WEB ADMIN INTERFACE
+# ================================================================
+
+WEB_ADMIN_PORT="8080"
+WEB_ADMIN_SCRIPT="/usr/local/bin/easy-asterisk-webadmin"
+WEB_ADMIN_SERVICE="/etc/systemd/system/easy-asterisk-webadmin.service"
+WEB_ADMIN_HTPASSWD="/etc/easy-asterisk/webadmin.htpasswd"
+
+create_web_admin_script() {
+    cat > "$WEB_ADMIN_SCRIPT" << 'WEBADMIN'
+#!/usr/bin/env python3
+"""
+Easy Asterisk Web Admin - Simple web interface for client management
+"""
+
+import http.server
+import socketserver
+import json
+import subprocess
+import os
+import re
+import base64
+import hashlib
+import html
+from urllib.parse import parse_qs, urlparse
+from functools import partial
+
+PORT = int(os.environ.get('WEBADMIN_PORT', 8080))
+HTPASSWD_FILE = "/etc/easy-asterisk/webadmin.htpasswd"
+PJSIP_CONF = "/etc/asterisk/pjsip.conf"
+CATEGORIES_FILE = "/etc/easy-asterisk/categories.conf"
+ROOMS_FILE = "/etc/easy-asterisk/rooms.conf"
+CONFIG_FILE = "/etc/easy-asterisk/config"
+
+def check_auth(headers):
+    """Verify HTTP Basic Auth against htpasswd file"""
+    if not os.path.exists(HTPASSWD_FILE):
+        return True  # No auth required if no htpasswd file
+
+    auth_header = headers.get('Authorization', '')
+    if not auth_header.startswith('Basic '):
+        return False
+
+    try:
+        credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
+        username, password = credentials.split(':', 1)
+
+        with open(HTPASSWD_FILE, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if ':' in line:
+                    stored_user, stored_hash = line.split(':', 1)
+                    if stored_user == username:
+                        # Support plain text (for simplicity) or SHA256
+                        if stored_hash.startswith('{SHA256}'):
+                            expected = '{SHA256}' + hashlib.sha256(password.encode()).hexdigest()
+                            return stored_hash == expected
+                        else:
+                            return stored_hash == password
+        return False
+    except:
+        return False
+
+def get_registered_endpoints():
+    """Get list of registered endpoints from Asterisk"""
+    try:
+        result = subprocess.run(
+            ['asterisk', '-rx', 'pjsip show endpoints'],
+            capture_output=True, text=True, timeout=5
+        )
+        endpoints = {}
+        for line in result.stdout.split('\n'):
+            match = re.match(r'\s*(\d{3})/\S+\s+(\S+)\s+', line)
+            if match:
+                ext, state = match.groups()
+                endpoints[ext] = 'online' if 'Avail' in state else 'offline'
+        return endpoints
+    except:
+        return {}
+
+def get_devices():
+    """Parse pjsip.conf to get device information"""
+    devices = []
+    if not os.path.exists(PJSIP_CONF):
+        return devices
+
+    with open(PJSIP_CONF, 'r') as f:
+        content = f.read()
+
+    device_pattern = re.compile(
+        r'; === Device: ([^(]+)\(([^)]+)\)\s*(\[AA:(yes|no)\])?\s*===\s*\n'
+        r'\[(\d+)\]\s*\n'
+        r'type=endpoint\s*\n'
+        r'(?:.*?\n)*?'
+        r'(?:transport=transport-(\w+))?\s*\n?'
+        r'(?:.*?\n)*?'
+        r'(?:media_encryption=(\w+))?\s*\n?'
+        r'(?:.*?\n)*?'
+        r'\[\5\]\s*\n'
+        r'type=auth\s*\n'
+        r'(?:.*?\n)*?'
+        r'password=(\S+)',
+        re.MULTILINE
+    )
+
+    # Simpler parsing approach
+    current_device = None
+    in_endpoint = False
+
+    for line in content.split('\n'):
+        line = line.strip()
+
+        if line.startswith('; === Device:'):
+            match = re.match(r'; === Device: (.+?) \((\w+)\)\s*(\[AA:(yes|no)\])?\s*===', line)
+            if match:
+                current_device = {
+                    'name': match.group(1).strip(),
+                    'category': match.group(2),
+                    'auto_answer': match.group(4) if match.group(3) else None,
+                    'extension': None,
+                    'password': None,
+                    'transport': 'udp',
+                    'encryption': 'no'
+                }
+
+        elif current_device and re.match(r'^\[(\d{3})\]$', line):
+            ext = re.match(r'^\[(\d{3})\]$', line).group(1)
+            if current_device['extension'] is None:
+                current_device['extension'] = ext
+                in_endpoint = True
+
+        elif current_device and in_endpoint:
+            if line.startswith('transport=transport-'):
+                current_device['transport'] = line.split('-')[1]
+            elif line.startswith('media_encryption='):
+                current_device['encryption'] = line.split('=')[1]
+            elif line.startswith('password='):
+                current_device['password'] = line.split('=')[1]
+                devices.append(current_device)
+                current_device = None
+                in_endpoint = False
+            elif line == '' or line.startswith('['):
+                in_endpoint = False
+
+    return devices
+
+def get_categories():
+    """Get categories from config file"""
+    categories = []
+    if os.path.exists(CATEGORIES_FILE):
+        with open(CATEGORIES_FILE, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    parts = line.split('|')
+                    if len(parts) >= 3:
+                        categories.append({
+                            'id': parts[0],
+                            'name': parts[1],
+                            'auto_answer': parts[2],
+                            'description': parts[3] if len(parts) > 3 else ''
+                        })
+    return categories
+
+def get_rooms():
+    """Get rooms from config file"""
+    rooms = []
+    if os.path.exists(ROOMS_FILE):
+        with open(ROOMS_FILE, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    parts = line.split('|')
+                    if len(parts) >= 5:
+                        rooms.append({
+                            'extension': parts[0],
+                            'name': parts[1],
+                            'members': parts[2],
+                            'timeout': parts[3],
+                            'type': parts[4]
+                        })
+    return rooms
+
+def delete_device(extension):
+    """Delete a device from pjsip.conf"""
+    if not os.path.exists(PJSIP_CONF):
+        return False, "Config file not found"
+
+    with open(PJSIP_CONF, 'r') as f:
+        lines = f.readlines()
+
+    new_lines = []
+    skip = False
+    found = False
+    pending_comment = None
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith('; === Device:'):
+            pending_comment = line
+            continue
+
+        if re.match(rf'^\[{extension}\]$', stripped):
+            if pending_comment:
+                found = True
+                skip = True
+                pending_comment = None
+                continue
+            elif found:
+                skip = True
+                continue
+
+        if pending_comment:
+            new_lines.append(pending_comment)
+            pending_comment = None
+
+        if skip and stripped == '':
+            skip = False
+            continue
+
+        if not skip:
+            new_lines.append(line)
+
+    if found:
+        with open(PJSIP_CONF, 'w') as f:
+            f.writelines(new_lines)
+        subprocess.run(['asterisk', '-rx', 'pjsip reload'], capture_output=True)
+        return True, "Device deleted"
+    return False, "Device not found"
+
+def generate_password(length=16):
+    """Generate a random password"""
+    import secrets
+    import string
+    chars = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(chars) for _ in range(length))
+
+def add_device(name, category, extension, conn_type='lan', auto_answer=None):
+    """Add a new device to pjsip.conf"""
+    if not os.path.exists(PJSIP_CONF):
+        return False, "Config file not found"
+
+    # Check if extension exists
+    with open(PJSIP_CONF, 'r') as f:
+        if f'[{extension}]' in f.read():
+            return False, "Extension already exists"
+
+    password = generate_password()
+
+    # Determine transport and encryption
+    if conn_type == 'fqdn':
+        transport = 'transport=transport-tls'
+        encryption = 'media_encryption=sdes'
+        ice = 'ice_support=yes'
+    else:
+        transport = 'transport=transport-udp'
+        encryption = 'media_encryption=no'
+        ice = ''
+
+    aa_tag = ''
+    if auto_answer == 'yes':
+        aa_tag = '[AA:yes] '
+    elif auto_answer == 'no':
+        aa_tag = '[AA:no] '
+
+    device_config = f'''
+; === Device: {name} ({category}) {aa_tag}===
+[{extension}]
+type=endpoint
+context=intercom
+{transport}
+disallow=all
+allow=opus
+allow=ulaw
+allow=alaw
+allow=g722
+{encryption}
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+{ice}
+auth={extension}
+aors={extension}
+callerid="{name}" <{extension}>
+
+[{extension}]
+type=auth
+auth_type=userpass
+username={extension}
+password={password}
+
+[{extension}]
+type=aor
+max_contacts=5
+remove_existing=yes
+qualify_frequency=60
+'''
+
+    with open(PJSIP_CONF, 'a') as f:
+        f.write(device_config)
+
+    subprocess.run(['asterisk', '-rx', 'pjsip reload'], capture_output=True)
+    subprocess.run(['chown', 'asterisk:asterisk', PJSIP_CONF], capture_output=True)
+
+    return True, {'extension': extension, 'password': password, 'name': name}
+
+def get_server_info():
+    """Get server configuration info"""
+    info = {
+        'domain': '',
+        'tls_enabled': False,
+        'server_ip': ''
+    }
+
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r') as f:
+            for line in f:
+                if line.startswith('DOMAIN_NAME='):
+                    info['domain'] = line.split('=', 1)[1].strip().strip('"')
+                elif line.startswith('ENABLE_TLS='):
+                    info['tls_enabled'] = 'y' in line.lower()
+
+    try:
+        result = subprocess.run(['hostname', '-I'], capture_output=True, text=True)
+        info['server_ip'] = result.stdout.split()[0] if result.stdout else ''
+    except:
+        pass
+
+    return info
+
+HTML_TEMPLATE = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Easy Asterisk - Client Admin</title>
+    <style>
+        :root {
+            --primary: #2563eb;
+            --success: #16a34a;
+            --danger: #dc2626;
+            --warning: #d97706;
+            --bg: #f8fafc;
+            --card-bg: #ffffff;
+            --text: #1e293b;
+            --text-muted: #64748b;
+            --border: #e2e8f0;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+        }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        header {
+            background: var(--primary);
+            color: white;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+        }
+        header h1 { font-size: 1.5rem; }
+        header p { opacity: 0.9; font-size: 0.9rem; }
+        .card {
+            background: var(--card-bg);
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            overflow: hidden;
+        }
+        .card-header {
+            background: #f1f5f9;
+            padding: 15px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .card-header h2 { font-size: 1.1rem; }
+        .card-body { padding: 20px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid var(--border); }
+        th { background: #f8fafc; font-weight: 600; }
+        .status {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 500;
+        }
+        .status-online { background: #dcfce7; color: #166534; }
+        .status-offline { background: #fee2e2; color: #991b1b; }
+        .btn {
+            display: inline-block;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            text-decoration: none;
+            transition: opacity 0.2s;
+        }
+        .btn:hover { opacity: 0.9; }
+        .btn-primary { background: var(--primary); color: white; }
+        .btn-danger { background: var(--danger); color: white; }
+        .btn-sm { padding: 4px 10px; font-size: 0.8rem; }
+        .form-group { margin-bottom: 15px; }
+        .form-group label { display: block; margin-bottom: 5px; font-weight: 500; }
+        .form-control {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            font-size: 1rem;
+        }
+        .form-row { display: flex; gap: 15px; flex-wrap: wrap; }
+        .form-row .form-group { flex: 1; min-width: 200px; }
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5);
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+        .modal.active { display: flex; }
+        .modal-content {
+            background: white;
+            padding: 25px;
+            border-radius: 12px;
+            max-width: 500px;
+            width: 90%;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+        .modal-header { margin-bottom: 20px; }
+        .modal-header h3 { margin-bottom: 5px; }
+        .tabs { display: flex; border-bottom: 2px solid var(--border); margin-bottom: 20px; }
+        .tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+        }
+        .tab.active { border-color: var(--primary); color: var(--primary); }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .alert {
+            padding: 12px 16px;
+            border-radius: 6px;
+            margin-bottom: 15px;
+        }
+        .alert-success { background: #dcfce7; color: #166534; }
+        .alert-error { background: #fee2e2; color: #991b1b; }
+        .credentials {
+            background: #f1f5f9;
+            padding: 15px;
+            border-radius: 6px;
+            font-family: monospace;
+        }
+        .credentials p { margin: 5px 0; }
+        .refresh-btn { background: none; border: none; cursor: pointer; font-size: 1.2rem; }
+        @media (max-width: 768px) {
+            .form-row { flex-direction: column; }
+            .form-row .form-group { min-width: 100%; }
+            th, td { padding: 8px; font-size: 0.9rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Easy Asterisk - Client Admin</h1>
+            <p>Manage SIP clients and extensions</p>
+        </header>
+
+        <div id="alert-container"></div>
+
+        <div class="tabs">
+            <div class="tab active" data-tab="devices">Devices</div>
+            <div class="tab" data-tab="rooms">Rooms</div>
+            <div class="tab" data-tab="categories">Categories</div>
+        </div>
+
+        <div id="devices" class="tab-content active">
+            <div class="card">
+                <div class="card-header">
+                    <h2>Registered Devices</h2>
+                    <div>
+                        <button class="refresh-btn" onclick="loadDevices()" title="Refresh">&#x21bb;</button>
+                        <button class="btn btn-primary" onclick="showAddModal()">+ Add Device</button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Extension</th>
+                                <th>Name</th>
+                                <th>Category</th>
+                                <th>Transport</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="devices-table"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div id="rooms" class="tab-content">
+            <div class="card">
+                <div class="card-header">
+                    <h2>Rooms (Ring/Page Groups)</h2>
+                    <button class="refresh-btn" onclick="loadRooms()" title="Refresh">&#x21bb;</button>
+                </div>
+                <div class="card-body">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Extension</th>
+                                <th>Name</th>
+                                <th>Type</th>
+                                <th>Members</th>
+                                <th>Timeout</th>
+                            </tr>
+                        </thead>
+                        <tbody id="rooms-table"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div id="categories" class="tab-content">
+            <div class="card">
+                <div class="card-header">
+                    <h2>Device Categories</h2>
+                    <button class="refresh-btn" onclick="loadCategories()" title="Refresh">&#x21bb;</button>
+                </div>
+                <div class="card-body">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Name</th>
+                                <th>Auto-Answer</th>
+                                <th>Description</th>
+                            </tr>
+                        </thead>
+                        <tbody id="categories-table"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Device Modal -->
+    <div id="add-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Add New Device</h3>
+                <p>Configure a new SIP client</p>
+            </div>
+            <form id="add-form" onsubmit="addDevice(event)">
+                <div class="form-group">
+                    <label>Device Name</label>
+                    <input type="text" name="name" class="form-control" required placeholder="e.g., Kitchen Phone">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Category</label>
+                        <select name="category" class="form-control" id="category-select"></select>
+                    </div>
+                    <div class="form-group">
+                        <label>Extension</label>
+                        <input type="number" name="extension" class="form-control" required min="100" max="999">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Connection Type</label>
+                        <select name="conn_type" class="form-control">
+                            <option value="lan">LAN/VPN (UDP)</option>
+                            <option value="fqdn">FQDN/Internet (TLS)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Auto-Answer Override</label>
+                        <select name="auto_answer" class="form-control">
+                            <option value="">Use Category Default</option>
+                            <option value="yes">Force Auto-Answer</option>
+                            <option value="no">Force Ring</option>
+                        </select>
+                    </div>
+                </div>
+                <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;">
+                    <button type="button" class="btn" onclick="closeModal()" style="background: #e2e8f0;">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Add Device</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Credentials Modal -->
+    <div id="credentials-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Device Created Successfully</h3>
+                <p>Save these credentials - the password cannot be retrieved later</p>
+            </div>
+            <div class="credentials" id="credentials-display"></div>
+            <div style="margin-top: 20px; text-align: right;">
+                <button class="btn btn-primary" onclick="closeCredentialsModal()">Done</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = '/api';
+
+        // Tab switching
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                tab.classList.add('active');
+                document.getElementById(tab.dataset.tab).classList.add('active');
+            });
+        });
+
+        function showAlert(message, type = 'success') {
+            const container = document.getElementById('alert-container');
+            container.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
+            setTimeout(() => container.innerHTML = '', 5000);
+        }
+
+        async function loadDevices() {
+            try {
+                const [devicesRes, statusRes] = await Promise.all([
+                    fetch(API_BASE + '/devices'),
+                    fetch(API_BASE + '/status')
+                ]);
+                const devices = await devicesRes.json();
+                const status = await statusRes.json();
+
+                const tbody = document.getElementById('devices-table');
+                tbody.innerHTML = devices.map(d => `
+                    <tr>
+                        <td><strong>${d.extension}</strong></td>
+                        <td>${d.name}</td>
+                        <td>${d.category}</td>
+                        <td>${d.transport.toUpperCase()}</td>
+                        <td><span class="status status-${status[d.extension] || 'offline'}">${status[d.extension] || 'offline'}</span></td>
+                        <td>
+                            <button class="btn btn-danger btn-sm" onclick="deleteDevice('${d.extension}', '${d.name}')">Delete</button>
+                        </td>
+                    </tr>
+                `).join('');
+            } catch (e) {
+                showAlert('Failed to load devices', 'error');
+            }
+        }
+
+        async function loadCategories() {
+            try {
+                const res = await fetch(API_BASE + '/categories');
+                const categories = await res.json();
+
+                document.getElementById('categories-table').innerHTML = categories.map(c => `
+                    <tr>
+                        <td>${c.id}</td>
+                        <td>${c.name}</td>
+                        <td>${c.auto_answer}</td>
+                        <td>${c.description}</td>
+                    </tr>
+                `).join('');
+
+                document.getElementById('category-select').innerHTML = categories.map(c =>
+                    `<option value="${c.id}">${c.name}</option>`
+                ).join('');
+            } catch (e) {
+                showAlert('Failed to load categories', 'error');
+            }
+        }
+
+        async function loadRooms() {
+            try {
+                const res = await fetch(API_BASE + '/rooms');
+                const rooms = await res.json();
+
+                document.getElementById('rooms-table').innerHTML = rooms.map(r => `
+                    <tr>
+                        <td>${r.extension}</td>
+                        <td>${r.name}</td>
+                        <td>${r.type}</td>
+                        <td>${r.members}</td>
+                        <td>${r.timeout}s</td>
+                    </tr>
+                `).join('');
+            } catch (e) {
+                showAlert('Failed to load rooms', 'error');
+            }
+        }
+
+        function showAddModal() {
+            document.getElementById('add-modal').classList.add('active');
+        }
+
+        function closeModal() {
+            document.getElementById('add-modal').classList.remove('active');
+            document.getElementById('add-form').reset();
+        }
+
+        function closeCredentialsModal() {
+            document.getElementById('credentials-modal').classList.remove('active');
+            loadDevices();
+        }
+
+        async function addDevice(e) {
+            e.preventDefault();
+            const form = e.target;
+            const data = {
+                name: form.name.value,
+                category: form.category.value,
+                extension: form.extension.value,
+                conn_type: form.conn_type.value,
+                auto_answer: form.auto_answer.value || null
+            };
+
+            try {
+                const res = await fetch(API_BASE + '/devices', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                const result = await res.json();
+
+                if (result.success) {
+                    closeModal();
+                    document.getElementById('credentials-display').innerHTML = `
+                        <p><strong>Extension:</strong> ${result.data.extension}</p>
+                        <p><strong>Password:</strong> ${result.data.password}</p>
+                        <p><strong>Name:</strong> ${result.data.name}</p>
+                    `;
+                    document.getElementById('credentials-modal').classList.add('active');
+                } else {
+                    showAlert(result.error || 'Failed to add device', 'error');
+                }
+            } catch (e) {
+                showAlert('Failed to add device', 'error');
+            }
+        }
+
+        async function deleteDevice(ext, name) {
+            if (!confirm(`Delete device ${ext} (${name})?`)) return;
+
+            try {
+                const res = await fetch(API_BASE + '/devices/' + ext, { method: 'DELETE' });
+                const result = await res.json();
+
+                if (result.success) {
+                    showAlert('Device deleted');
+                    loadDevices();
+                } else {
+                    showAlert(result.error || 'Failed to delete', 'error');
+                }
+            } catch (e) {
+                showAlert('Failed to delete device', 'error');
+            }
+        }
+
+        // Initial load
+        loadDevices();
+        loadCategories();
+        loadRooms();
+
+        // Auto-refresh status every 30 seconds
+        setInterval(loadDevices, 30000);
+    </script>
+</body>
+</html>
+'''
+
+class WebAdminHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # Suppress default logging
+
+    def send_auth_required(self):
+        self.send_response(401)
+        self.send_header('WWW-Authenticate', 'Basic realm="Easy Asterisk Admin"')
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        self.wfile.write(b'<h1>Authentication Required</h1>')
+
+    def do_GET(self):
+        if not check_auth(self.headers):
+            self.send_auth_required()
+            return
+
+        path = urlparse(self.path).path
+
+        if path == '/' or path == '/clients':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(HTML_TEMPLATE.encode())
+
+        elif path == '/api/devices':
+            devices = get_devices()
+            self.send_json(devices)
+
+        elif path == '/api/status':
+            status = get_registered_endpoints()
+            self.send_json(status)
+
+        elif path == '/api/categories':
+            categories = get_categories()
+            self.send_json(categories)
+
+        elif path == '/api/rooms':
+            rooms = get_rooms()
+            self.send_json(rooms)
+
+        elif path == '/api/server':
+            info = get_server_info()
+            self.send_json(info)
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if not check_auth(self.headers):
+            self.send_auth_required()
+            return
+
+        path = urlparse(self.path).path
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length).decode('utf-8')
+
+        if path == '/api/devices':
+            try:
+                data = json.loads(body)
+                success, result = add_device(
+                    data['name'],
+                    data['category'],
+                    data['extension'],
+                    data.get('conn_type', 'lan'),
+                    data.get('auto_answer')
+                )
+                if success:
+                    self.send_json({'success': True, 'data': result})
+                else:
+                    self.send_json({'success': False, 'error': result}, 400)
+            except Exception as e:
+                self.send_json({'success': False, 'error': str(e)}, 400)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_DELETE(self):
+        if not check_auth(self.headers):
+            self.send_auth_required()
+            return
+
+        path = urlparse(self.path).path
+        match = re.match(r'/api/devices/(\d+)', path)
+
+        if match:
+            ext = match.group(1)
+            success, msg = delete_device(ext)
+            self.send_json({'success': success, 'message': msg})
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def send_json(self, data, status=200):
+        self.send_response(status)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+def main():
+    with socketserver.TCPServer(("", PORT), WebAdminHandler) as httpd:
+        print(f"Easy Asterisk Web Admin running on port {PORT}")
+        httpd.serve_forever()
+
+if __name__ == "__main__":
+    main()
+WEBADMIN
+    chmod +x "$WEB_ADMIN_SCRIPT"
+    print_success "Web admin script created"
+}
+
+create_web_admin_service() {
+    cat > "$WEB_ADMIN_SERVICE" << EOF
+[Unit]
+Description=Easy Asterisk Web Admin
+After=network.target asterisk.service
+
+[Service]
+Type=simple
+Environment=WEBADMIN_PORT=${WEB_ADMIN_PORT}
+ExecStart=/usr/bin/python3 ${WEB_ADMIN_SCRIPT}
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    print_success "Web admin service created"
+}
+
+setup_web_admin_auth() {
+    print_header "Web Admin Authentication"
+    echo "Set up login credentials for the web admin interface."
+    echo ""
+
+    read -p "Username [admin]: " wa_user
+    wa_user="${wa_user:-admin}"
+
+    while true; do
+        read -s -p "Password: " wa_pass
+        echo ""
+        if [[ ${#wa_pass} -lt 6 ]]; then
+            print_error "Password must be at least 6 characters"
+            continue
+        fi
+        read -s -p "Confirm password: " wa_pass2
+        echo ""
+        if [[ "$wa_pass" != "$wa_pass2" ]]; then
+            print_error "Passwords don't match"
+            continue
+        fi
+        break
+    done
+
+    # Store with SHA256 hash
+    local hash=$(echo -n "$wa_pass" | sha256sum | awk '{print $1}')
+    echo "${wa_user}:{SHA256}${hash}" > "$WEB_ADMIN_HTPASSWD"
+    chmod 600 "$WEB_ADMIN_HTPASSWD"
+    print_success "Authentication configured for user: $wa_user"
+}
+
+web_admin_menu() {
+    load_config
+    local server_ip=$(hostname -I | awk '{print $1}')
+
+    print_header "Web Admin Management"
+
+    # Check current status
+    local status="stopped"
+    if systemctl is-active --quiet easy-asterisk-webadmin 2>/dev/null; then
+        status="running"
+    fi
+
+    echo "  Status: ${status^^}"
+    if [[ "$status" == "running" ]]; then
+        echo "  URL: http://${server_ip}:${WEB_ADMIN_PORT}/clients"
+        [[ -n "$DOMAIN_NAME" ]] && echo "  URL: http://${DOMAIN_NAME}:${WEB_ADMIN_PORT}/clients"
+    fi
+    echo ""
+    echo "  1) Start Web Admin"
+    echo "  2) Stop Web Admin"
+    echo "  3) Restart Web Admin"
+    echo "  4) Configure Authentication"
+    echo "  5) Change Port (current: ${WEB_ADMIN_PORT})"
+    echo "  6) View Logs"
+    echo "  0) Back"
+    echo ""
+    read -p "  Select: " choice
+
+    case $choice in
+        1)
+            if [[ ! -f "$WEB_ADMIN_SCRIPT" ]]; then
+                print_info "Installing web admin..."
+                create_web_admin_script
+                create_web_admin_service
+            fi
+            if [[ ! -f "$WEB_ADMIN_HTPASSWD" ]]; then
+                setup_web_admin_auth
+            fi
+            systemctl enable easy-asterisk-webadmin
+            systemctl start easy-asterisk-webadmin
+            sleep 2
+            if systemctl is-active --quiet easy-asterisk-webadmin; then
+                print_success "Web Admin started"
+                echo ""
+                echo "  Access at: http://${server_ip}:${WEB_ADMIN_PORT}/clients"
+                [[ -n "$DOMAIN_NAME" ]] && echo "  Or: http://${DOMAIN_NAME}:${WEB_ADMIN_PORT}/clients"
+            else
+                print_error "Failed to start. Check: journalctl -u easy-asterisk-webadmin"
+            fi
+            ;;
+        2)
+            systemctl stop easy-asterisk-webadmin
+            systemctl disable easy-asterisk-webadmin 2>/dev/null
+            print_success "Web Admin stopped"
+            ;;
+        3)
+            systemctl restart easy-asterisk-webadmin
+            print_success "Web Admin restarted"
+            ;;
+        4)
+            setup_web_admin_auth
+            systemctl restart easy-asterisk-webadmin 2>/dev/null
+            ;;
+        5)
+            read -p "New port [${WEB_ADMIN_PORT}]: " new_port
+            new_port="${new_port:-$WEB_ADMIN_PORT}"
+            if [[ "$new_port" =~ ^[0-9]+$ ]] && [[ "$new_port" -ge 1024 ]] && [[ "$new_port" -le 65535 ]]; then
+                WEB_ADMIN_PORT="$new_port"
+                create_web_admin_service
+                systemctl restart easy-asterisk-webadmin 2>/dev/null
+                print_success "Port changed to $new_port"
+            else
+                print_error "Invalid port (must be 1024-65535)"
+            fi
+            ;;
+        6)
+            journalctl -u easy-asterisk-webadmin -n 50 --no-pager
+            ;;
+        0) return ;;
+    esac
+}
+
 submenu_server() {
     clear
     print_header "Server Settings"
@@ -3626,6 +4737,7 @@ submenu_server() {
     echo "  8) Router Doctor"
     echo "  9) Configure VLAN Subnets"
     echo " 10) Provisioning Manager"
+    echo " 11) Web Admin (Client Management)"
     echo "  0) Back"
     read -p "  Select: " choice
     case $choice in
@@ -3639,6 +4751,7 @@ submenu_server() {
         8) router_doctor ;;
         9) configure_vlan_subnets ;;
         10) provisioning_manager_menu ;;
+        11) web_admin_menu ;;
         0) return ;;
     esac
     [[ "$choice" != "0" ]] && read -p "Press Enter..."
