@@ -4090,6 +4090,136 @@ def remove_device_from_room(room_ext, device_ext):
                 return update_room_members(room_ext, new_members)
     return False, "Room not found"
 
+def change_device_category(extension, new_category):
+    """Change a device's category in pjsip.conf"""
+    if not os.path.exists(PJSIP_CONF):
+        return False, "Config file not found"
+
+    with open(PJSIP_CONF, 'r') as f:
+        lines = f.readlines()
+
+    new_lines = []
+    found = False
+    in_device = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Match device comment line: ; === Device: Name (category) ===
+        if stripped.startswith('; === Device:') and f'[{extension}]' in ''.join(lines[lines.index(line):lines.index(line)+3]):
+            # Parse and update category in comment
+            match = re.match(r'^; === Device: (.+?) \(([^)]+)\)(.*?)===', stripped)
+            if match:
+                name = match.group(1)
+                old_cat = match.group(2)
+                rest = match.group(3)
+                new_lines.append(f'; === Device: {name} ({new_category}){rest}===\n')
+                found = True
+                in_device = True
+                continue
+
+        new_lines.append(line)
+
+    if found:
+        with open(PJSIP_CONF, 'w') as f:
+            f.writelines(new_lines)
+        subprocess.run(['asterisk', '-rx', 'pjsip reload'], capture_output=True)
+        return True, "Category changed"
+    return False, "Device not found"
+
+def create_room(extension, name, room_type='ring', timeout='60'):
+    """Create a new room in rooms.conf"""
+    if not os.path.exists(ROOMS_FILE):
+        with open(ROOMS_FILE, 'w') as f:
+            f.write('# Format: ext|name|members|timeout|type(ring/page)\n')
+
+    # Check if extension already exists
+    with open(ROOMS_FILE, 'r') as f:
+        for line in f:
+            if line.strip() and not line.startswith('#'):
+                parts = line.split('|')
+                if len(parts) >= 1 and parts[0] == extension:
+                    return False, "Room extension already exists"
+
+    # Add new room
+    with open(ROOMS_FILE, 'a') as f:
+        f.write(f'{extension}|{name}||{timeout}|{room_type}\n')
+
+    # Rebuild dialplan
+    subprocess.run(['/usr/local/bin/easy-asterisk', '--rebuild-dialplan'], capture_output=True)
+    return True, "Room created"
+
+def delete_room(extension):
+    """Delete a room from rooms.conf"""
+    if not os.path.exists(ROOMS_FILE):
+        return False, "Rooms file not found"
+
+    with open(ROOMS_FILE, 'r') as f:
+        lines = f.readlines()
+
+    new_lines = []
+    found = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith('#'):
+            parts = stripped.split('|')
+            if len(parts) >= 1 and parts[0] == extension:
+                found = True
+                continue
+        new_lines.append(line)
+
+    if found:
+        with open(ROOMS_FILE, 'w') as f:
+            f.writelines(new_lines)
+        subprocess.run(['/usr/local/bin/easy-asterisk', '--rebuild-dialplan'], capture_output=True)
+        return True, "Room deleted"
+    return False, "Room not found"
+
+def create_category(cat_id, name, auto_answer='', description=''):
+    """Create a new category in categories.conf"""
+    if not os.path.exists(CATEGORIES_FILE):
+        with open(CATEGORIES_FILE, 'w') as f:
+            f.write('# Format: id|name|auto_answer|description\n')
+
+    # Check if category already exists
+    with open(CATEGORIES_FILE, 'r') as f:
+        for line in f:
+            if line.strip() and not line.startswith('#'):
+                parts = line.split('|')
+                if len(parts) >= 1 and parts[0] == cat_id:
+                    return False, "Category ID already exists"
+
+    # Add new category
+    with open(CATEGORIES_FILE, 'a') as f:
+        f.write(f'{cat_id}|{name}|{auto_answer}|{description}\n')
+
+    return True, "Category created"
+
+def delete_category(cat_id):
+    """Delete a category from categories.conf"""
+    if not os.path.exists(CATEGORIES_FILE):
+        return False, "Categories file not found"
+
+    with open(CATEGORIES_FILE, 'r') as f:
+        lines = f.readlines()
+
+    new_lines = []
+    found = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith('#'):
+            parts = stripped.split('|')
+            if len(parts) >= 1 and parts[0] == cat_id:
+                found = True
+                continue
+        new_lines.append(line)
+
+    if found:
+        with open(CATEGORIES_FILE, 'w') as f:
+            f.writelines(new_lines)
+        return True, "Category deleted"
+    return False, "Category not found"
+
 def generate_password(length=16):
     """Generate a random password"""
     import secrets
@@ -4379,22 +4509,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="card">
                 <div class="card-header">
                     <h2>Rooms (Ring/Page Groups)</h2>
-                    <button class="refresh-btn" onclick="loadRooms()" title="Refresh">&#x21bb;</button>
+                    <div>
+                        <button class="refresh-btn" onclick="loadRooms()" title="Refresh">&#x21bb;</button>
+                        <button class="btn btn-primary" onclick="showAddRoomModal()">+ Add Room</button>
+                    </div>
                 </div>
-                <div class="card-body">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Extension</th>
-                                <th>Name</th>
-                                <th>Type</th>
-                                <th>Members</th>
-                                <th>Timeout</th>
-                            </tr>
-                        </thead>
-                        <tbody id="rooms-table"></tbody>
-                    </table>
-                </div>
+                <div class="card-body" id="rooms-container"></div>
             </div>
         </div>
 
@@ -4402,21 +4522,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="card">
                 <div class="card-header">
                     <h2>Device Categories</h2>
-                    <button class="refresh-btn" onclick="loadCategories()" title="Refresh">&#x21bb;</button>
+                    <div>
+                        <button class="refresh-btn" onclick="loadCategories()" title="Refresh">&#x21bb;</button>
+                        <button class="btn btn-primary" onclick="showAddCategoryModal()">+ Add Category</button>
+                    </div>
                 </div>
-                <div class="card-body">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>ID</th>
-                                <th>Name</th>
-                                <th>Auto-Answer</th>
-                                <th>Description</th>
-                            </tr>
-                        </thead>
-                        <tbody id="categories-table"></tbody>
-                    </table>
-                </div>
+                <div class="card-body" id="categories-container"></div>
             </div>
         </div>
     </div>
@@ -4503,9 +4614,84 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- Add Room Modal -->
+    <div id="add-room-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Add Room</h3>
+                <p>Create a ring or page group</p>
+            </div>
+            <form id="add-room-form" onsubmit="addRoom(event)">
+                <div class="form-group">
+                    <label>Room Name</label>
+                    <input type="text" name="name" class="form-control" required placeholder="e.g., All Phones">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Extension</label>
+                        <input type="number" name="extension" class="form-control" required min="100" max="999" placeholder="e.g., 199">
+                    </div>
+                    <div class="form-group">
+                        <label>Type</label>
+                        <select name="type" class="form-control">
+                            <option value="ring">Ring (sequential)</option>
+                            <option value="page">Page (all at once)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Timeout (seconds)</label>
+                    <input type="number" name="timeout" class="form-control" value="60" min="10" max="300">
+                </div>
+                <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;">
+                    <button type="button" class="btn" onclick="closeAddRoomModal()" style="background: #e2e8f0;">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create Room</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Add Category Modal -->
+    <div id="add-category-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Add Category</h3>
+                <p>Create a device category</p>
+            </div>
+            <form id="add-category-form" onsubmit="addCategory(event)">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Category ID (short)</label>
+                        <input type="text" name="id" class="form-control" required placeholder="e.g., kiosk" pattern="[a-z0-9]+" title="Lowercase letters and numbers only">
+                    </div>
+                    <div class="form-group">
+                        <label>Display Name</label>
+                        <input type="text" name="name" class="form-control" required placeholder="e.g., Kiosk Phones">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Auto-Answer (SIP header)</label>
+                        <input type="text" name="auto_answer" class="form-control" placeholder="e.g., answer-after=0">
+                    </div>
+                    <div class="form-group">
+                        <label>Description</label>
+                        <input type="text" name="description" class="form-control" placeholder="Optional description">
+                    </div>
+                </div>
+                <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;">
+                    <button type="button" class="btn" onclick="closeAddCategoryModal()" style="background: #e2e8f0;">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create Category</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <script>
         const API_BASE = '/api';
         let roomsCache = [];
+        let categoriesCache = [];
+        let devicesCache = [];
 
         // Tab switching
         document.querySelectorAll('.tab').forEach(tab => {
@@ -4524,24 +4710,35 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         }
 
         function getRoomOptions(deviceExt) {
-            // Build room options, marking rooms device is already in
             return roomsCache.map(r => {
-                const members = r.members.split(',').map(m => m.trim());
+                const members = (r.members || '').split(',').map(m => m.trim()).filter(m => m);
                 const inRoom = members.includes(deviceExt);
                 return `<option value="${r.extension}" ${inRoom ? 'disabled' : ''}>${r.name}${inRoom ? ' (member)' : ''}</option>`;
             }).join('');
         }
 
+        function getCategoryOptions(currentCat) {
+            return categoriesCache.map(c =>
+                `<option value="${c.id}" ${c.id === currentCat ? 'disabled' : ''}>${c.name}${c.id === currentCat ? ' (current)' : ''}</option>`
+            ).join('');
+        }
+
         async function loadDevices() {
             try {
-                const [devicesRes, statusRes, roomsRes] = await Promise.all([
+                const [devicesRes, statusRes, roomsRes, catRes] = await Promise.all([
                     fetch(API_BASE + '/devices'),
                     fetch(API_BASE + '/status'),
-                    fetch(API_BASE + '/rooms')
+                    fetch(API_BASE + '/rooms'),
+                    fetch(API_BASE + '/categories')
                 ]);
                 const devices = await devicesRes.json();
                 const status = await statusRes.json();
                 roomsCache = await roomsRes.json();
+                categoriesCache = await catRes.json();
+
+                // Sort by extension
+                devices.sort((a, b) => parseInt(a.extension) - parseInt(b.extension));
+                devicesCache = devices;
 
                 const tbody = document.getElementById('devices-table');
                 tbody.innerHTML = devices.map(d => `
@@ -4552,15 +4749,24 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         <td>${d.transport.toUpperCase()}</td>
                         <td><span class="status status-${status[d.extension] || 'offline'}">${status[d.extension] || 'offline'}</span></td>
                         <td style="white-space:nowrap">
-                            <select onchange="addToRoom('${d.extension}', this.value); this.selectedIndex=0;" style="padding:4px;margin-right:5px">
-                                <option value="">Add to Room...</option>
+                            <select onchange="addToRoom('${d.extension}', this.value); this.selectedIndex=0;" style="padding:4px;margin-right:3px;font-size:12px">
+                                <option value="">Room...</option>
                                 ${getRoomOptions(d.extension)}
                             </select>
-                            <button class="btn btn-primary btn-sm" onclick="showRenameModal('${d.extension}', '${d.name}')" style="margin-right:5px">Rename</button>
+                            <select onchange="changeCategory('${d.extension}', this.value); this.selectedIndex=0;" style="padding:4px;margin-right:3px;font-size:12px">
+                                <option value="">Category...</option>
+                                ${getCategoryOptions(d.category)}
+                            </select>
+                            <button class="btn btn-primary btn-sm" onclick="showRenameModal('${d.extension}', '${d.name}')" style="margin-right:3px">Rename</button>
                             <button class="btn btn-danger btn-sm" onclick="deleteDevice('${d.extension}', '${d.name}')">Delete</button>
                         </td>
                     </tr>
                 `).join('');
+
+                // Update category select in add device form
+                document.getElementById('category-select').innerHTML = categoriesCache.map(c =>
+                    `<option value="${c.id}">${c.name}</option>`
+                ).join('');
             } catch (e) {
                 showAlert('Failed to load devices', 'error');
             }
@@ -4606,6 +4812,40 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             }
         }
 
+        async function changeCategory(deviceExt, newCat) {
+            if (!newCat) return;
+            try {
+                const res = await fetch(API_BASE + '/devices/' + deviceExt + '/category', {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({category: newCat})
+                });
+                const result = await res.json();
+                if (result.success) {
+                    showAlert('Category changed');
+                    loadDevices();
+                    loadCategories();
+                } else {
+                    showAlert(result.message || 'Failed to change category', 'error');
+                }
+            } catch (e) {
+                showAlert('Failed to change category', 'error');
+            }
+        }
+
+        function renderDeviceRow(d, showRemove = false, removeAction = null) {
+            return `
+                <tr>
+                    <td><strong>${d.extension}</strong></td>
+                    <td>${d.name}</td>
+                    <td>${d.category}</td>
+                    <td>
+                        ${showRemove ? `<button class="btn btn-danger btn-sm" onclick="${removeAction}">Remove</button>` : ''}
+                    </td>
+                </tr>
+            `;
+        }
+
         async function loadCategories() {
             try {
                 const [catRes, devRes] = await Promise.all([
@@ -4614,29 +4854,49 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 ]);
                 const categories = await catRes.json();
                 const devices = await devRes.json();
+                devices.sort((a, b) => parseInt(a.extension) - parseInt(b.extension));
+                categoriesCache = categories;
 
-                // Group devices by category
                 const devicesByCategory = {};
                 devices.forEach(d => {
                     if (!devicesByCategory[d.category]) devicesByCategory[d.category] = [];
                     devicesByCategory[d.category].push(d);
                 });
 
-                document.getElementById('categories-table').innerHTML = categories.map(c => {
+                document.getElementById('categories-container').innerHTML = categories.map(c => {
                     const catDevices = devicesByCategory[c.id] || [];
-                    const deviceList = catDevices.length > 0
-                        ? catDevices.map(d => `<span style="background:#e0e0e0;padding:2px 6px;border-radius:3px;margin-right:4px;display:inline-block;margin-bottom:2px">${d.extension}: ${d.name}</span>`).join('')
-                        : '<em style="color:#888">No devices</em>';
+                    const deviceRows = catDevices.length > 0
+                        ? `<table style="width:100%;margin-top:10px">
+                            <thead><tr><th>Ext</th><th>Name</th><th>Actions</th></tr></thead>
+                            <tbody>
+                            ${catDevices.map(d => `
+                                <tr>
+                                    <td><strong>${d.extension}</strong></td>
+                                    <td>${d.name}</td>
+                                    <td>
+                                        <select onchange="changeCategory('${d.extension}', this.value); this.selectedIndex=0;" style="padding:4px;font-size:12px">
+                                            <option value="">Move to...</option>
+                                            ${categories.filter(cat => cat.id !== c.id).map(cat => `<option value="${cat.id}">${cat.name}</option>`).join('')}
+                                        </select>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                            </tbody>
+                           </table>`
+                        : '<p style="color:#888;margin-top:10px"><em>No devices in this category</em></p>';
                     return `
-                    <tr>
-                        <td>${c.id}</td>
-                        <td>${c.name}</td>
-                        <td>${c.auto_answer}</td>
-                        <td>${c.description}</td>
-                    </tr>
-                    <tr>
-                        <td colspan="4" style="background:#f9f9f9;padding:8px 15px"><strong>Devices:</strong> ${deviceList}</td>
-                    </tr>
+                        <div style="border:1px solid #e0e0e0;border-radius:8px;padding:15px;margin-bottom:15px">
+                            <div style="display:flex;justify-content:space-between;align-items:center">
+                                <div>
+                                    <strong style="font-size:1.1em">${c.name}</strong>
+                                    <span style="color:#666;margin-left:10px">(${c.id})</span>
+                                    ${c.auto_answer ? `<span style="background:#e0e0e0;padding:2px 6px;border-radius:3px;margin-left:10px;font-size:12px">AA: ${c.auto_answer}</span>` : ''}
+                                </div>
+                                <button class="btn btn-danger btn-sm" onclick="deleteCategory('${c.id}')" ${catDevices.length > 0 ? 'disabled title="Remove all devices first"' : ''}>Delete</button>
+                            </div>
+                            ${c.description ? `<p style="color:#666;margin:5px 0 0 0">${c.description}</p>` : ''}
+                            ${deviceRows}
+                        </div>
                     `;
                 }).join('');
 
@@ -4650,26 +4910,153 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
         async function loadRooms() {
             try {
-                const res = await fetch(API_BASE + '/rooms');
-                const rooms = await res.json();
+                const [roomsRes, devicesRes] = await Promise.all([
+                    fetch(API_BASE + '/rooms'),
+                    fetch(API_BASE + '/devices')
+                ]);
+                const rooms = await roomsRes.json();
+                const devices = await devicesRes.json();
                 roomsCache = rooms;
 
-                document.getElementById('rooms-table').innerHTML = rooms.map(r => {
-                    const membersList = r.members ? r.members.split(',').map(m =>
-                        `<span style="background:#e0e0e0;padding:2px 6px;border-radius:3px;margin-right:4px;display:inline-block;cursor:pointer" onclick="removeFromRoom('${r.extension}', '${m.trim()}')" title="Click to remove">${m.trim()}</span>`
-                    ).join('') : '<em>None</em>';
+                const deviceMap = {};
+                devices.forEach(d => deviceMap[d.extension] = d);
+
+                document.getElementById('rooms-container').innerHTML = rooms.map(r => {
+                    const members = (r.members || '').split(',').map(m => m.trim()).filter(m => m);
+                    const memberRows = members.length > 0
+                        ? `<table style="width:100%;margin-top:10px">
+                            <thead><tr><th>Ext</th><th>Name</th><th>Actions</th></tr></thead>
+                            <tbody>
+                            ${members.map(ext => {
+                                const dev = deviceMap[ext];
+                                return `
+                                    <tr>
+                                        <td><strong>${ext}</strong></td>
+                                        <td>${dev ? dev.name : '<em>Unknown</em>'}</td>
+                                        <td><button class="btn btn-danger btn-sm" onclick="removeFromRoom('${r.extension}', '${ext}')">Remove</button></td>
+                                    </tr>
+                                `;
+                            }).join('')}
+                            </tbody>
+                           </table>`
+                        : '<p style="color:#888;margin-top:10px"><em>No members in this room</em></p>';
                     return `
-                    <tr>
-                        <td>${r.extension}</td>
-                        <td>${r.name}</td>
-                        <td>${r.type}</td>
-                        <td>${membersList}</td>
-                        <td>${r.timeout}s</td>
-                    </tr>
+                        <div style="border:1px solid #e0e0e0;border-radius:8px;padding:15px;margin-bottom:15px">
+                            <div style="display:flex;justify-content:space-between;align-items:center">
+                                <div>
+                                    <strong style="font-size:1.1em">${r.name}</strong>
+                                    <span style="color:#666;margin-left:10px">(ext ${r.extension})</span>
+                                    <span style="background:${r.type === 'page' ? '#dcfce7' : '#dbeafe'};padding:2px 6px;border-radius:3px;margin-left:10px;font-size:12px">${r.type}</span>
+                                    <span style="color:#666;margin-left:10px">${r.timeout}s timeout</span>
+                                </div>
+                                <button class="btn btn-danger btn-sm" onclick="deleteRoom('${r.extension}')">Delete Room</button>
+                            </div>
+                            ${memberRows}
+                        </div>
                     `;
-                }).join('');
+                }).join('') || '<p style="color:#888"><em>No rooms configured</em></p>';
             } catch (e) {
                 showAlert('Failed to load rooms', 'error');
+            }
+        }
+
+        // Room modal functions
+        function showAddRoomModal() { document.getElementById('add-room-modal').classList.add('active'); }
+        function closeAddRoomModal() { document.getElementById('add-room-modal').classList.remove('active'); document.getElementById('add-room-form').reset(); }
+
+        async function addRoom(e) {
+            e.preventDefault();
+            const form = e.target;
+            const data = {
+                extension: form.extension.value,
+                name: form.name.value,
+                type: form.type.value,
+                timeout: form.timeout.value
+            };
+            try {
+                const res = await fetch(API_BASE + '/rooms', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                const result = await res.json();
+                if (result.success) {
+                    closeAddRoomModal();
+                    showAlert('Room created');
+                    loadRooms();
+                    loadDevices();
+                } else {
+                    showAlert(result.error || 'Failed to create room', 'error');
+                }
+            } catch (e) {
+                showAlert('Failed to create room', 'error');
+            }
+        }
+
+        async function deleteRoom(ext) {
+            if (!confirm('Delete this room? Devices will not be affected.')) return;
+            try {
+                const res = await fetch(API_BASE + '/rooms/' + ext, { method: 'DELETE' });
+                const result = await res.json();
+                if (result.success) {
+                    showAlert('Room deleted');
+                    loadRooms();
+                    loadDevices();
+                } else {
+                    showAlert(result.error || 'Failed to delete room', 'error');
+                }
+            } catch (e) {
+                showAlert('Failed to delete room', 'error');
+            }
+        }
+
+        // Category modal functions
+        function showAddCategoryModal() { document.getElementById('add-category-modal').classList.add('active'); }
+        function closeAddCategoryModal() { document.getElementById('add-category-modal').classList.remove('active'); document.getElementById('add-category-form').reset(); }
+
+        async function addCategory(e) {
+            e.preventDefault();
+            const form = e.target;
+            const data = {
+                id: form.id.value,
+                name: form.name.value,
+                auto_answer: form.auto_answer.value,
+                description: form.description.value
+            };
+            try {
+                const res = await fetch(API_BASE + '/categories', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                const result = await res.json();
+                if (result.success) {
+                    closeAddCategoryModal();
+                    showAlert('Category created');
+                    loadCategories();
+                    loadDevices();
+                } else {
+                    showAlert(result.error || 'Failed to create category', 'error');
+                }
+            } catch (e) {
+                showAlert('Failed to create category', 'error');
+            }
+        }
+
+        async function deleteCategory(id) {
+            if (!confirm('Delete this category?')) return;
+            try {
+                const res = await fetch(API_BASE + '/categories/' + id, { method: 'DELETE' });
+                const result = await res.json();
+                if (result.success) {
+                    showAlert('Category deleted');
+                    loadCategories();
+                    loadDevices();
+                } else {
+                    showAlert(result.error || 'Failed to delete category', 'error');
+                }
+            } catch (e) {
+                showAlert('Failed to delete category', 'error');
             }
         }
 
@@ -4882,6 +5269,34 @@ class WebAdminHandler(http.server.BaseHTTPRequestHandler):
                 self.send_response(404)
                 self.end_headers()
 
+        elif path == '/api/rooms':
+            # Create room: POST /api/rooms
+            try:
+                data = json.loads(body)
+                success, msg = create_room(
+                    data['extension'],
+                    data['name'],
+                    data.get('type', 'ring'),
+                    data.get('timeout', '60')
+                )
+                self.send_json({'success': success, 'message': msg})
+            except Exception as e:
+                self.send_json({'success': False, 'error': str(e)}, 400)
+
+        elif path == '/api/categories':
+            # Create category: POST /api/categories
+            try:
+                data = json.loads(body)
+                success, msg = create_category(
+                    data['id'],
+                    data['name'],
+                    data.get('auto_answer', ''),
+                    data.get('description', '')
+                )
+                self.send_json({'success': success, 'message': msg})
+            except Exception as e:
+                self.send_json({'success': False, 'error': str(e)}, 400)
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -4902,11 +5317,27 @@ class WebAdminHandler(http.server.BaseHTTPRequestHandler):
             return
 
         # Remove device from room: DELETE /api/rooms/{room_ext}/members/{device_ext}
-        room_match = re.match(r'/api/rooms/(\d+)/members/(\d+)', path)
-        if room_match:
-            room_ext = room_match.group(1)
-            device_ext = room_match.group(2)
+        room_member_match = re.match(r'/api/rooms/(\d+)/members/(\d+)', path)
+        if room_member_match:
+            room_ext = room_member_match.group(1)
+            device_ext = room_member_match.group(2)
             success, msg = remove_device_from_room(room_ext, device_ext)
+            self.send_json({'success': success, 'message': msg})
+            return
+
+        # Delete room: DELETE /api/rooms/{ext}
+        room_match = re.match(r'/api/rooms/(\d+)$', path)
+        if room_match:
+            ext = room_match.group(1)
+            success, msg = delete_room(ext)
+            self.send_json({'success': success, 'message': msg})
+            return
+
+        # Delete category: DELETE /api/categories/{id}
+        cat_match = re.match(r'/api/categories/([a-z0-9]+)$', path)
+        if cat_match:
+            cat_id = cat_match.group(1)
+            success, msg = delete_category(cat_id)
             self.send_json({'success': success, 'message': msg})
             return
 
@@ -4919,12 +5350,29 @@ class WebAdminHandler(http.server.BaseHTTPRequestHandler):
             return
 
         path = urlparse(self.path).path
-        match = re.match(r'/api/devices/(\d+)', path)
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length).decode('utf-8')
 
-        if match:
-            ext = match.group(1)
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode('utf-8')
+        # Change device category: PUT /api/devices/{ext}/category
+        cat_match = re.match(r'/api/devices/(\d+)/category$', path)
+        if cat_match:
+            ext = cat_match.group(1)
+            try:
+                data = json.loads(body)
+                new_cat = data.get('category', '').strip()
+                if not new_cat:
+                    self.send_json({'success': False, 'error': 'Category required'}, 400)
+                    return
+                success, msg = change_device_category(ext, new_cat)
+                self.send_json({'success': success, 'message': msg})
+            except Exception as e:
+                self.send_json({'success': False, 'error': str(e)}, 400)
+            return
+
+        # Rename device: PUT /api/devices/{ext}
+        rename_match = re.match(r'/api/devices/(\d+)$', path)
+        if rename_match:
+            ext = rename_match.group(1)
             try:
                 data = json.loads(body)
                 new_name = data.get('name', '').strip()
@@ -4935,9 +5383,10 @@ class WebAdminHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({'success': success, 'message': msg})
             except Exception as e:
                 self.send_json({'success': False, 'error': str(e)}, 400)
-        else:
-            self.send_response(404)
-            self.end_headers()
+            return
+
+        self.send_response(404)
+        self.end_headers()
 
     def send_json(self, data, status=200):
         self.send_response(status)
@@ -5082,34 +5531,33 @@ web_admin_menu() {
         2)
             print_info "Stopping web admin..."
 
-            # Stop and disable the systemd service
-            systemctl stop easy-asterisk-webadmin 2>/dev/null
-            systemctl disable easy-asterisk-webadmin 2>/dev/null || true
+            # First stop attempt
+            echo "  Running: systemctl stop easy-asterisk-webadmin"
+            systemctl stop easy-asterisk-webadmin 2>/dev/null || true
+            sleep 1
 
-            # Wait for service to stop
-            for i in 1 2 3; do
-                if ! systemctl is-active --quiet easy-asterisk-webadmin 2>/dev/null; then
-                    break
-                fi
+            # Check if port is still in use
+            if lsof -ti ":${WEB_ADMIN_PORT}" >/dev/null 2>&1; then
+                echo "  Port ${WEB_ADMIN_PORT} still in use, stopping again..."
+                systemctl stop easy-asterisk-webadmin 2>/dev/null || true
                 sleep 1
-            done
+            fi
 
-            # Kill any remaining processes on our port (belt and suspenders)
+            # If still in use, kill directly
             local port_pids=$(lsof -ti ":${WEB_ADMIN_PORT}" 2>/dev/null)
             if [[ -n "$port_pids" ]]; then
-                print_info "Killing remaining processes on port ${WEB_ADMIN_PORT}..."
+                echo "  Killing remaining processes on port ${WEB_ADMIN_PORT}..."
                 echo "$port_pids" | xargs kill -9 2>/dev/null || true
                 sleep 1
             fi
 
+            # Disable the service
+            systemctl disable easy-asterisk-webadmin 2>/dev/null || true
+
             # Final verification
             if lsof -ti ":${WEB_ADMIN_PORT}" >/dev/null 2>&1; then
                 print_error "Port ${WEB_ADMIN_PORT} still in use!"
-                echo "  Debug: lsof -ti :${WEB_ADMIN_PORT}"
-                lsof -ti ":${WEB_ADMIN_PORT}" 2>/dev/null | while read pid; do
-                    echo "    PID $pid: $(ps -p $pid -o comm= 2>/dev/null)"
-                done
-                echo "  Try: sudo kill -9 \$(sudo lsof -ti :${WEB_ADMIN_PORT})"
+                lsof -i ":${WEB_ADMIN_PORT}" 2>/dev/null
             else
                 print_success "Web Admin stopped"
             fi
