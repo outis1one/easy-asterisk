@@ -4009,6 +4009,81 @@ def rename_device(extension, new_name):
         return True, "Device renamed"
     return False, "Device not found"
 
+def update_room_members(room_ext, new_members):
+    """Update room members"""
+    if not os.path.exists(ROOMS_FILE):
+        return False, "Rooms file not found"
+
+    # Read all rooms
+    rooms = []
+    found = False
+    with open(ROOMS_FILE, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                rooms.append(line)
+                continue
+            parts = line.split('|')
+            if len(parts) >= 5 and parts[0] == room_ext:
+                # Update this room's members
+                parts[2] = new_members
+                rooms.append('|'.join(parts))
+                found = True
+            else:
+                rooms.append(line)
+
+    if found:
+        with open(ROOMS_FILE, 'w') as f:
+            f.write('\n'.join(rooms) + '\n')
+        # Rebuild dialplan
+        subprocess.run(['/usr/local/bin/easy-asterisk', '--rebuild-dialplan'], capture_output=True)
+        return True, "Room members updated"
+    return False, "Room not found"
+
+def add_device_to_room(room_ext, device_ext):
+    """Add a device to a room"""
+    if not os.path.exists(ROOMS_FILE):
+        return False, "Rooms file not found"
+
+    # Find the room and its current members
+    with open(ROOMS_FILE, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split('|')
+            if len(parts) >= 5 and parts[0] == room_ext:
+                current_members = parts[2].split(',') if parts[2] else []
+                # Check if device is already a member
+                if device_ext in current_members:
+                    return False, "Device already in room"
+                current_members.append(device_ext)
+                new_members = ','.join(current_members)
+                return update_room_members(room_ext, new_members)
+    return False, "Room not found"
+
+def remove_device_from_room(room_ext, device_ext):
+    """Remove a device from a room"""
+    if not os.path.exists(ROOMS_FILE):
+        return False, "Rooms file not found"
+
+    # Find the room and its current members
+    with open(ROOMS_FILE, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split('|')
+            if len(parts) >= 5 and parts[0] == room_ext:
+                current_members = parts[2].split(',') if parts[2] else []
+                # Check if device is a member
+                if device_ext not in current_members:
+                    return False, "Device not in room"
+                current_members.remove(device_ext)
+                new_members = ','.join(current_members)
+                return update_room_members(room_ext, new_members)
+    return False, "Room not found"
+
 def generate_password(length=16):
     """Generate a random password"""
     import secrets
@@ -4424,6 +4499,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
     <script>
         const API_BASE = '/api';
+        let roomsCache = [];
 
         // Tab switching
         document.querySelectorAll('.tab').forEach(tab => {
@@ -4441,14 +4517,25 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             setTimeout(() => container.innerHTML = '', 5000);
         }
 
+        function getRoomOptions(deviceExt) {
+            // Build room options, marking rooms device is already in
+            return roomsCache.map(r => {
+                const members = r.members.split(',').map(m => m.trim());
+                const inRoom = members.includes(deviceExt);
+                return `<option value="${r.extension}" ${inRoom ? 'disabled' : ''}>${r.name}${inRoom ? ' (member)' : ''}</option>`;
+            }).join('');
+        }
+
         async function loadDevices() {
             try {
-                const [devicesRes, statusRes] = await Promise.all([
+                const [devicesRes, statusRes, roomsRes] = await Promise.all([
                     fetch(API_BASE + '/devices'),
-                    fetch(API_BASE + '/status')
+                    fetch(API_BASE + '/status'),
+                    fetch(API_BASE + '/rooms')
                 ]);
                 const devices = await devicesRes.json();
                 const status = await statusRes.json();
+                roomsCache = await roomsRes.json();
 
                 const tbody = document.getElementById('devices-table');
                 tbody.innerHTML = devices.map(d => `
@@ -4458,7 +4545,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         <td>${d.category}</td>
                         <td>${d.transport.toUpperCase()}</td>
                         <td><span class="status status-${status[d.extension] || 'offline'}">${status[d.extension] || 'offline'}</span></td>
-                        <td>
+                        <td style="white-space:nowrap">
+                            <select onchange="addToRoom('${d.extension}', this.value); this.selectedIndex=0;" style="padding:4px;margin-right:5px">
+                                <option value="">Add to Room...</option>
+                                ${getRoomOptions(d.extension)}
+                            </select>
                             <button class="btn btn-primary btn-sm" onclick="showRenameModal('${d.extension}', '${d.name}')" style="margin-right:5px">Rename</button>
                             <button class="btn btn-danger btn-sm" onclick="deleteDevice('${d.extension}', '${d.name}')">Delete</button>
                         </td>
@@ -4469,19 +4560,79 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             }
         }
 
+        async function addToRoom(deviceExt, roomExt) {
+            if (!roomExt) return;
+            try {
+                const res = await fetch(API_BASE + '/rooms/' + roomExt + '/members', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({device: deviceExt})
+                });
+                const result = await res.json();
+                if (result.success) {
+                    showAlert('Device added to room');
+                    loadDevices();
+                    loadRooms();
+                } else {
+                    showAlert(result.message || 'Failed to add to room', 'error');
+                }
+            } catch (e) {
+                showAlert('Failed to add device to room', 'error');
+            }
+        }
+
+        async function removeFromRoom(roomExt, deviceExt) {
+            if (!confirm('Remove device ' + deviceExt + ' from this room?')) return;
+            try {
+                const res = await fetch(API_BASE + '/rooms/' + roomExt + '/members/' + deviceExt, {
+                    method: 'DELETE'
+                });
+                const result = await res.json();
+                if (result.success) {
+                    showAlert('Device removed from room');
+                    loadRooms();
+                    loadDevices();
+                } else {
+                    showAlert(result.message || 'Failed to remove from room', 'error');
+                }
+            } catch (e) {
+                showAlert('Failed to remove device from room', 'error');
+            }
+        }
+
         async function loadCategories() {
             try {
-                const res = await fetch(API_BASE + '/categories');
-                const categories = await res.json();
+                const [catRes, devRes] = await Promise.all([
+                    fetch(API_BASE + '/categories'),
+                    fetch(API_BASE + '/devices')
+                ]);
+                const categories = await catRes.json();
+                const devices = await devRes.json();
 
-                document.getElementById('categories-table').innerHTML = categories.map(c => `
+                // Group devices by category
+                const devicesByCategory = {};
+                devices.forEach(d => {
+                    if (!devicesByCategory[d.category]) devicesByCategory[d.category] = [];
+                    devicesByCategory[d.category].push(d);
+                });
+
+                document.getElementById('categories-table').innerHTML = categories.map(c => {
+                    const catDevices = devicesByCategory[c.id] || [];
+                    const deviceList = catDevices.length > 0
+                        ? catDevices.map(d => `<span style="background:#e0e0e0;padding:2px 6px;border-radius:3px;margin-right:4px;display:inline-block;margin-bottom:2px">${d.extension}: ${d.name}</span>`).join('')
+                        : '<em style="color:#888">No devices</em>';
+                    return `
                     <tr>
                         <td>${c.id}</td>
                         <td>${c.name}</td>
                         <td>${c.auto_answer}</td>
                         <td>${c.description}</td>
                     </tr>
-                `).join('');
+                    <tr>
+                        <td colspan="4" style="background:#f9f9f9;padding:8px 15px"><strong>Devices:</strong> ${deviceList}</td>
+                    </tr>
+                    `;
+                }).join('');
 
                 document.getElementById('category-select').innerHTML = categories.map(c =>
                     `<option value="${c.id}">${c.name}</option>`
@@ -4495,16 +4646,22 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             try {
                 const res = await fetch(API_BASE + '/rooms');
                 const rooms = await res.json();
+                roomsCache = rooms;
 
-                document.getElementById('rooms-table').innerHTML = rooms.map(r => `
+                document.getElementById('rooms-table').innerHTML = rooms.map(r => {
+                    const membersList = r.members ? r.members.split(',').map(m =>
+                        `<span style="background:#e0e0e0;padding:2px 6px;border-radius:3px;margin-right:4px;display:inline-block;cursor:pointer" onclick="removeFromRoom('${r.extension}', '${m.trim()}')" title="Click to remove">${m.trim()}</span>`
+                    ).join('') : '<em>None</em>';
+                    return `
                     <tr>
                         <td>${r.extension}</td>
                         <td>${r.name}</td>
                         <td>${r.type}</td>
-                        <td>${r.members}</td>
+                        <td>${membersList}</td>
                         <td>${r.timeout}s</td>
                     </tr>
-                `).join('');
+                    `;
+                }).join('');
             } catch (e) {
                 showAlert('Failed to load rooms', 'error');
             }
@@ -4699,6 +4856,26 @@ class WebAdminHandler(http.server.BaseHTTPRequestHandler):
                     self.send_json({'success': False, 'error': result}, 400)
             except Exception as e:
                 self.send_json({'success': False, 'error': str(e)}, 400)
+
+        elif path.startswith('/api/rooms/') and path.endswith('/members'):
+            # Add device to room: POST /api/rooms/{room_ext}/members with {device: ext}
+            room_match = re.match(r'/api/rooms/(\d+)/members', path)
+            if room_match:
+                try:
+                    room_ext = room_match.group(1)
+                    data = json.loads(body)
+                    device_ext = data.get('device')
+                    if not device_ext:
+                        self.send_json({'success': False, 'error': 'Device extension required'}, 400)
+                        return
+                    success, msg = add_device_to_room(room_ext, device_ext)
+                    self.send_json({'success': success, 'message': msg})
+                except Exception as e:
+                    self.send_json({'success': False, 'error': str(e)}, 400)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -4709,15 +4886,26 @@ class WebAdminHandler(http.server.BaseHTTPRequestHandler):
             return
 
         path = urlparse(self.path).path
-        match = re.match(r'/api/devices/(\d+)', path)
 
-        if match:
-            ext = match.group(1)
+        # Delete device
+        device_match = re.match(r'/api/devices/(\d+)$', path)
+        if device_match:
+            ext = device_match.group(1)
             success, msg = delete_device(ext)
             self.send_json({'success': success, 'message': msg})
-        else:
-            self.send_response(404)
-            self.end_headers()
+            return
+
+        # Remove device from room: DELETE /api/rooms/{room_ext}/members/{device_ext}
+        room_match = re.match(r'/api/rooms/(\d+)/members/(\d+)', path)
+        if room_match:
+            room_ext = room_match.group(1)
+            device_ext = room_match.group(2)
+            success, msg = remove_device_from_room(room_ext, device_ext)
+            self.send_json({'success': success, 'message': msg})
+            return
+
+        self.send_response(404)
+        self.end_headers()
 
     def do_PUT(self):
         if not check_auth(self.headers):
@@ -4866,32 +5054,36 @@ web_admin_menu() {
             ;;
         2)
             print_info "Stopping web admin..."
-            systemctl stop easy-asterisk-webadmin 2>/dev/null || true
+            # First, mask the service to prevent Restart=always from respawning
+            # This is critical - without masking, systemd will restart the process
+            systemctl mask easy-asterisk-webadmin 2>/dev/null || true
+
+            # Now stop the service
+            if systemctl is-active --quiet easy-asterisk-webadmin 2>/dev/null; then
+                print_info "Stopping systemd service..."
+                systemctl stop easy-asterisk-webadmin 2>/dev/null || true
+                sleep 1
+            fi
+
+            # Disable the service
             systemctl disable easy-asterisk-webadmin 2>/dev/null || true
-            sleep 1
-            # Kill any Python processes running the webadmin script
-            if pgrep -f "${WEB_ADMIN_SCRIPT}" >/dev/null 2>&1; then
-                print_info "Killing remaining processes..."
-                pkill -f "${WEB_ADMIN_SCRIPT}" 2>/dev/null || true
+
+            # Kill any remaining processes on our port
+            local port_pids=$(lsof -ti ":${WEB_ADMIN_PORT}" 2>/dev/null)
+            if [[ -n "$port_pids" ]]; then
+                print_info "Killing processes on port ${WEB_ADMIN_PORT}..."
+                echo "$port_pids" | xargs kill -9 2>/dev/null || true
                 sleep 1
             fi
-            # Force kill if still running
-            if pgrep -f "${WEB_ADMIN_SCRIPT}" >/dev/null 2>&1; then
-                print_info "Force killing..."
-                pkill -9 -f "${WEB_ADMIN_SCRIPT}" 2>/dev/null || true
-                sleep 1
-            fi
-            # Kill anything on the port
-            if command -v fuser &>/dev/null; then
-                fuser -k "${WEB_ADMIN_PORT}/tcp" 2>/dev/null || true
-            elif command -v lsof &>/dev/null; then
-                local pid=$(lsof -ti ":${WEB_ADMIN_PORT}" 2>/dev/null)
-                [[ -n "$pid" ]] && kill -9 $pid 2>/dev/null || true
-            fi
-            # Verify stopped
-            sleep 1
-            if pgrep -f "${WEB_ADMIN_SCRIPT}" >/dev/null 2>&1; then
-                print_error "Process still running. Try: sudo pkill -9 -f easy-asterisk-webadmin"
+
+            # Unmask the service so it can be started again later
+            systemctl unmask easy-asterisk-webadmin 2>/dev/null || true
+            systemctl daemon-reload 2>/dev/null || true
+
+            # Final verification
+            if lsof -ti ":${WEB_ADMIN_PORT}" >/dev/null 2>&1; then
+                print_error "Port ${WEB_ADMIN_PORT} still in use!"
+                echo "  Try manually: sudo lsof -ti :${WEB_ADMIN_PORT} | xargs sudo kill -9"
             else
                 print_success "Web Admin stopped"
             fi
