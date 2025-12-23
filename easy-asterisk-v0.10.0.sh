@@ -163,6 +163,7 @@ load_config() {
     HAS_VLANS="${HAS_VLANS:-n}"
     VLAN_SUBNETS="${VLAN_SUBNETS:-}"
     WEB_ADMIN_PORT="${WEB_ADMIN_PORT:-8080}"
+    WEB_ADMIN_AUTH_DISABLED="${WEB_ADMIN_AUTH_DISABLED:-false}"
     return 0
 }
 
@@ -199,6 +200,7 @@ PTT_DEVICE="$PTT_DEVICE"
 PTT_KEYCODE="$PTT_KEYCODE"
 LOCAL_CIDR="$LOCAL_CIDR"
 WEB_ADMIN_PORT="$WEB_ADMIN_PORT"
+WEB_ADMIN_AUTH_DISABLED="$WEB_ADMIN_AUTH_DISABLED"
 EOF
     chmod 644 "$CONFIG_FILE"
 
@@ -3720,6 +3722,7 @@ from urllib.parse import parse_qs, urlparse
 from functools import partial
 
 PORT = int(os.environ.get('WEBADMIN_PORT', 8080))
+AUTH_DISABLED = os.environ.get('WEBADMIN_AUTH_DISABLED', 'false').lower() == 'true'
 HTPASSWD_FILE = "/etc/easy-asterisk/webadmin.htpasswd"
 PJSIP_CONF = "/etc/asterisk/pjsip.conf"
 CATEGORIES_FILE = "/etc/easy-asterisk/categories.conf"
@@ -3728,6 +3731,9 @@ CONFIG_FILE = "/etc/easy-asterisk/config"
 
 def check_auth(headers):
     """Verify HTTP Basic Auth against htpasswd file"""
+    if AUTH_DISABLED:
+        return True  # Auth disabled for reverse proxy mode
+
     if not os.path.exists(HTPASSWD_FILE):
         return True  # No auth required if no htpasswd file
 
@@ -4960,8 +4966,9 @@ After=network.target asterisk.service
 [Service]
 Type=simple
 Environment=WEBADMIN_PORT=${WEB_ADMIN_PORT}
+Environment=WEBADMIN_AUTH_DISABLED=${WEB_ADMIN_AUTH_DISABLED:-false}
 ExecStart=/usr/bin/python3 ${WEB_ADMIN_SCRIPT}
-Restart=always
+Restart=on-failure
 RestartSec=5
 User=root
 
@@ -5020,6 +5027,11 @@ web_admin_menu() {
         echo "  URL: http://${server_ip}:${WEB_ADMIN_PORT}/clients"
         [[ -n "$DOMAIN_NAME" ]] && echo "  URL: http://${DOMAIN_NAME}:${WEB_ADMIN_PORT}/clients"
     fi
+    if [[ "${WEB_ADMIN_AUTH_DISABLED:-}" == "true" ]]; then
+        echo "  Auth: DISABLED (reverse proxy mode)"
+    else
+        echo "  Auth: Internal basic auth"
+    fi
     echo ""
     echo "  1) Start Web Admin"
     echo "  2) Stop Web Admin"
@@ -5027,19 +5039,34 @@ web_admin_menu() {
     echo "  4) Configure Authentication"
     echo "  5) Change Port (current: ${WEB_ADMIN_PORT})"
     echo "  6) View Logs"
+    echo "  7) Reverse Proxy Setup (Caddy)"
     echo "  0) Back"
     echo ""
     read -p "  Select: " choice
 
     case $choice in
         1)
+            # Stop any existing instance first
+            if systemctl is-active --quiet easy-asterisk-webadmin 2>/dev/null; then
+                print_info "Stopping existing instance..."
+                systemctl stop easy-asterisk-webadmin 2>/dev/null || true
+                sleep 1
+            fi
+            # Kill anything on our port
+            local port_pids=$(lsof -ti ":${WEB_ADMIN_PORT}" 2>/dev/null)
+            if [[ -n "$port_pids" ]]; then
+                echo "$port_pids" | xargs kill -9 2>/dev/null || true
+                sleep 1
+            fi
+
             # Always regenerate script to ensure latest version
             print_info "Installing/updating web admin..."
             create_web_admin_script
             create_web_admin_service
-            if [[ ! -f "$WEB_ADMIN_HTPASSWD" ]]; then
+            if [[ ! -f "$WEB_ADMIN_HTPASSWD" ]] && [[ "${WEB_ADMIN_AUTH_DISABLED:-}" != "true" ]]; then
                 setup_web_admin_auth
             fi
+            systemctl daemon-reload
             systemctl enable easy-asterisk-webadmin
             systemctl start easy-asterisk-webadmin
             sleep 2
@@ -5054,36 +5081,35 @@ web_admin_menu() {
             ;;
         2)
             print_info "Stopping web admin..."
-            # First, mask the service to prevent Restart=always from respawning
-            # This is critical - without masking, systemd will restart the process
-            systemctl mask easy-asterisk-webadmin 2>/dev/null || true
 
-            # Now stop the service
-            if systemctl is-active --quiet easy-asterisk-webadmin 2>/dev/null; then
-                print_info "Stopping systemd service..."
-                systemctl stop easy-asterisk-webadmin 2>/dev/null || true
-                sleep 1
-            fi
-
-            # Disable the service
+            # Stop and disable the systemd service
+            systemctl stop easy-asterisk-webadmin 2>/dev/null
             systemctl disable easy-asterisk-webadmin 2>/dev/null || true
 
-            # Kill any remaining processes on our port
+            # Wait for service to stop
+            for i in 1 2 3; do
+                if ! systemctl is-active --quiet easy-asterisk-webadmin 2>/dev/null; then
+                    break
+                fi
+                sleep 1
+            done
+
+            # Kill any remaining processes on our port (belt and suspenders)
             local port_pids=$(lsof -ti ":${WEB_ADMIN_PORT}" 2>/dev/null)
             if [[ -n "$port_pids" ]]; then
-                print_info "Killing processes on port ${WEB_ADMIN_PORT}..."
+                print_info "Killing remaining processes on port ${WEB_ADMIN_PORT}..."
                 echo "$port_pids" | xargs kill -9 2>/dev/null || true
                 sleep 1
             fi
 
-            # Unmask the service so it can be started again later
-            systemctl unmask easy-asterisk-webadmin 2>/dev/null || true
-            systemctl daemon-reload 2>/dev/null || true
-
             # Final verification
             if lsof -ti ":${WEB_ADMIN_PORT}" >/dev/null 2>&1; then
                 print_error "Port ${WEB_ADMIN_PORT} still in use!"
-                echo "  Try manually: sudo lsof -ti :${WEB_ADMIN_PORT} | xargs sudo kill -9"
+                echo "  Debug: lsof -ti :${WEB_ADMIN_PORT}"
+                lsof -ti ":${WEB_ADMIN_PORT}" 2>/dev/null | while read pid; do
+                    echo "    PID $pid: $(ps -p $pid -o comm= 2>/dev/null)"
+                done
+                echo "  Try: sudo kill -9 \$(sudo lsof -ti :${WEB_ADMIN_PORT})"
             else
                 print_success "Web Admin stopped"
             fi
@@ -5111,6 +5137,60 @@ web_admin_menu() {
             ;;
         6)
             journalctl -u easy-asterisk-webadmin -n 50 --no-pager
+            ;;
+        7)
+            print_header "Reverse Proxy Setup (Caddy)"
+            echo ""
+            echo "  When using a reverse proxy like Caddy with HTTPS and its own"
+            echo "  basic auth, you can disable internal authentication."
+            echo ""
+            echo "  Current auth: $([[ "${WEB_ADMIN_AUTH_DISABLED:-}" == "true" ]] && echo "DISABLED" || echo "ENABLED")"
+            echo ""
+            echo "  1) Disable internal auth (for reverse proxy with its own auth)"
+            echo "  2) Enable internal auth (standalone use)"
+            echo "  3) Show Caddyfile example"
+            echo "  0) Back"
+            echo ""
+            read -p "  Select: " rp_choice
+            case $rp_choice in
+                1)
+                    WEB_ADMIN_AUTH_DISABLED="true"
+                    save_config
+                    create_web_admin_script
+                    systemctl restart easy-asterisk-webadmin 2>/dev/null || true
+                    print_success "Internal auth disabled. Use Caddy basic_auth for security."
+                    ;;
+                2)
+                    WEB_ADMIN_AUTH_DISABLED="false"
+                    save_config
+                    create_web_admin_script
+                    if [[ ! -f "$WEB_ADMIN_HTPASSWD" ]]; then
+                        setup_web_admin_auth
+                    fi
+                    systemctl restart easy-asterisk-webadmin 2>/dev/null || true
+                    print_success "Internal auth enabled"
+                    ;;
+                3)
+                    echo ""
+                    echo "  Add to your Caddyfile (docker-compose):"
+                    echo ""
+                    echo "  ─────────────────────────────────────────"
+                    echo "  webadmin.yourdomain.com {"
+                    echo "      basicauth /* {"
+                    echo "          admin \$2a\$14\$... # use: caddy hash-password"
+                    echo "      }"
+                    echo "      reverse_proxy host.docker.internal:${WEB_ADMIN_PORT}"
+                    echo "  }"
+                    echo "  ─────────────────────────────────────────"
+                    echo ""
+                    echo "  Generate password hash: docker exec -it caddy caddy hash-password"
+                    echo "  Then paste the hash after the username in Caddyfile."
+                    echo ""
+                    echo "  If Caddy can't reach host.docker.internal, use your server's"
+                    echo "  LAN IP instead (e.g., 192.168.1.x:${WEB_ADMIN_PORT})"
+                    echo ""
+                    ;;
+            esac
             ;;
         0) return ;;
     esac
