@@ -3773,58 +3773,66 @@ def get_registered_endpoints():
         return {}
 
 def get_devices():
-    """Parse pjsip.conf to get device information"""
+    """Parse pjsip.conf to get device information - matches bash script logic"""
     devices = []
     if not os.path.exists(PJSIP_CONF):
         return devices
 
     with open(PJSIP_CONF, 'r') as f:
-        content = f.read()
+        lines = f.readlines()
 
-    # Parse devices using a state machine approach
-    current_device = None
-    current_ext = None
+    dev_name = None
+    dev_cat = None
+    dev_aa = None
 
-    for line in content.split('\n'):
+    for line in lines:
         line = line.strip()
 
-        # Match device comment line (handles variable spacing before ===)
-        if line.startswith('; === Device:'):
-            match = re.match(r'; === Device:\s*(.+?)\s*\((\w+)\)\s*(\[AA:(yes|no)\])?\s*===', line)
-            if match:
-                current_device = {
-                    'name': match.group(1).strip(),
-                    'category': match.group(2),
-                    'auto_answer': match.group(4) if match.group(3) else None,
-                    'extension': None,
-                    'password': None,
-                    'transport': 'udp',
-                    'encryption': 'no'
-                }
-                current_ext = None
+        # Match device comment line
+        if '; === Device:' in line:
+            # Parse: ; === Device: Name (category) [AA:yes/no] ===
+            temp = line.split('; === Device:')[1] if '; === Device:' in line else ''
+            temp = temp.split('===')[0].strip()  # Remove trailing ===
 
-        # Match extension section header
-        elif current_device and re.match(r'^\[(\d{3})\]$', line):
-            ext = re.match(r'^\[(\d{3})\]$', line).group(1)
-            if current_device['extension'] is None:
-                current_device['extension'] = ext
-                current_ext = ext
-            elif ext == current_ext:
-                # Same extension, could be auth or aor section
-                pass
+            # Check for AA tag
+            dev_aa = None
+            if '[AA:yes]' in temp:
+                dev_aa = 'yes'
+                temp = temp.replace('[AA:yes]', '').strip()
+            elif '[AA:no]' in temp:
+                dev_aa = 'no'
+                temp = temp.replace('[AA:no]', '').strip()
 
-        # Parse properties within sections
-        elif current_device and current_ext:
-            if line.startswith('transport=transport-'):
-                current_device['transport'] = line.split('-')[1]
-            elif line.startswith('media_encryption='):
-                current_device['encryption'] = line.split('=')[1]
-            elif line.startswith('password='):
-                current_device['password'] = line.split('=')[1]
-                # Found password, device is complete
-                devices.append(current_device)
-                current_device = None
-                current_ext = None
+            # Extract category from parentheses
+            if '(' in temp and ')' in temp:
+                dev_cat = temp[temp.rfind('(')+1:temp.rfind(')')]
+                dev_name = temp[:temp.rfind('(')].strip()
+            else:
+                dev_name = temp
+                dev_cat = 'unknown'
+
+        # Match extension line [xxx]
+        elif dev_name and re.match(r'^\[(\d+)\]$', line):
+            ext = re.match(r'^\[(\d+)\]$', line).group(1)
+            devices.append({
+                'name': dev_name,
+                'category': dev_cat,
+                'extension': ext,
+                'auto_answer': dev_aa,
+                'transport': 'udp',  # Default, will check below
+                'encryption': 'no'
+            })
+            dev_name = None
+            dev_cat = None
+            dev_aa = None
+
+        # Update transport/encryption for last added device
+        elif devices and line.startswith('transport=transport-'):
+            devices[-1]['transport'] = line.split('transport-')[1]
+        elif devices and line.startswith('media_encryption='):
+            val = line.split('=')[1]
+            if val != 'no':
+                devices[-1]['encryption'] = val
 
     return devices
 
