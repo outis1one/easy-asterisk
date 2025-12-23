@@ -3756,18 +3756,28 @@ def check_auth(headers):
         return False
 
 def get_registered_endpoints():
-    """Get list of registered endpoints from Asterisk"""
+    """Get list of registered endpoints from Asterisk - matches bash script logic"""
     try:
+        # Get full endpoint details which shows Contact lines with Avail status
         result = subprocess.run(
             ['asterisk', '-rx', 'pjsip show endpoints'],
-            capture_output=True, text=True, timeout=5
+            capture_output=True, text=True, timeout=10
         )
         endpoints = {}
+        current_endpoint = None
+
         for line in result.stdout.split('\n'):
-            match = re.match(r'\s*(\d{3})/\S+\s+(\S+)\s+', line)
-            if match:
-                ext, state = match.groups()
-                endpoints[ext] = 'online' if 'Avail' in state else 'offline'
+            # Match endpoint header line: " Endpoint:  101/101"
+            endpoint_match = re.match(r'\s*Endpoint:\s+(\d+)/', line)
+            if endpoint_match:
+                current_endpoint = endpoint_match.group(1)
+                endpoints[current_endpoint] = 'offline'  # Default to offline
+
+            # Match contact line with Avail status: "  Contact:  101/sip:...   Avail"
+            if current_endpoint and 'Contact:' in line:
+                if 'Avail' in line or 'NonQual' in line:
+                    endpoints[current_endpoint] = 'online'
+
         return endpoints
     except:
         return {}
@@ -4692,8 +4702,15 @@ web_admin_menu() {
             fi
             ;;
         2)
-            systemctl stop easy-asterisk-webadmin
+            systemctl stop easy-asterisk-webadmin 2>/dev/null
             systemctl disable easy-asterisk-webadmin 2>/dev/null
+            # Kill any remaining processes
+            pkill -f "easy-asterisk-webadmin" 2>/dev/null || true
+            sleep 1
+            # Force kill if still running
+            pkill -9 -f "easy-asterisk-webadmin" 2>/dev/null || true
+            # Release the port if still held
+            fuser -k "${WEB_ADMIN_PORT}/tcp" 2>/dev/null || true
             print_success "Web Admin stopped"
             ;;
         3)
