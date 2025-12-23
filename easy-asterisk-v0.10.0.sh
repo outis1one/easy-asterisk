@@ -4175,6 +4175,35 @@ def delete_room(extension):
         return True, "Room deleted"
     return False, "Room not found"
 
+def rename_room(extension, new_name):
+    """Rename a room in rooms.conf"""
+    if not os.path.exists(ROOMS_FILE):
+        return False, "Rooms file not found"
+
+    with open(ROOMS_FILE, 'r') as f:
+        lines = f.readlines()
+
+    new_lines = []
+    found = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith('#'):
+            parts = stripped.split('|')
+            if len(parts) >= 5 and parts[0] == extension:
+                # Update name (parts[1])
+                parts[1] = new_name
+                new_lines.append('|'.join(parts) + '\n')
+                found = True
+                continue
+        new_lines.append(line)
+
+    if found:
+        with open(ROOMS_FILE, 'w') as f:
+            f.writelines(new_lines)
+        subprocess.run(['/usr/local/bin/easy-asterisk', '--rebuild-dialplan'], capture_output=True)
+        return True, "Room renamed"
+    return False, "Room not found"
+
 def create_category(cat_id, name, auto_answer='', description=''):
     """Create a new category in categories.conf"""
     if not os.path.exists(CATEGORIES_FILE):
@@ -4218,6 +4247,34 @@ def delete_category(cat_id):
         with open(CATEGORIES_FILE, 'w') as f:
             f.writelines(new_lines)
         return True, "Category deleted"
+    return False, "Category not found"
+
+def rename_category(cat_id, new_name):
+    """Rename a category in categories.conf"""
+    if not os.path.exists(CATEGORIES_FILE):
+        return False, "Categories file not found"
+
+    with open(CATEGORIES_FILE, 'r') as f:
+        lines = f.readlines()
+
+    new_lines = []
+    found = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith('#'):
+            parts = stripped.split('|')
+            if len(parts) >= 2 and parts[0] == cat_id:
+                # Update name (parts[1])
+                parts[1] = new_name
+                new_lines.append('|'.join(parts) + '\n')
+                found = True
+                continue
+        new_lines.append(line)
+
+    if found:
+        with open(CATEGORIES_FILE, 'w') as f:
+            f.writelines(new_lines)
+        return True, "Category renamed"
     return False, "Category not found"
 
 def generate_password(length=16):
@@ -4399,10 +4456,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .btn-primary { background: var(--primary); color: white; }
         .btn-danger { background: var(--danger); color: white; }
         .btn-sm { padding: 4px 10px; font-size: 0.8rem; }
-        .action-select { width: 95px; padding: 5px 4px; font-size: 12px; border: 1px solid #ccc; border-radius: 4px; }
-        .action-btn { width: 65px; padding: 5px 4px; font-size: 12px; }
-        .sort-control { display: flex; align-items: center; gap: 8px; }
-        .sort-control label { font-size: 13px; color: #666; }
+        .action-select { width: 100px; padding: 5px 4px; font-size: 12px; border: 1px solid #ccc; border-radius: 4px; margin-right: 4px; }
+        .action-btn { width: 100px; padding: 5px 4px; font-size: 12px; margin-right: 4px; }
+        .sort-control { display: inline-flex; align-items: center; gap: 8px; margin-right: 15px; }
+        .sort-control label { font-size: 13px; color: #666; white-space: nowrap; }
         .sort-control select { padding: 5px 8px; font-size: 13px; border: 1px solid #ccc; border-radius: 4px; }
         .form-group { margin-bottom: 15px; }
         .form-group label { display: block; margin-bottom: 5px; font-weight: 500; }
@@ -4938,7 +4995,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                                     <span style="color:#666;margin-left:10px">(${c.id})</span>
                                     ${c.auto_answer ? `<span style="background:#e0e0e0;padding:2px 6px;border-radius:3px;margin-left:10px;font-size:12px">AA: ${c.auto_answer}</span>` : ''}
                                 </div>
-                                <button class="btn btn-danger btn-sm" onclick="deleteCategory('${c.id}')" ${catDevices.length > 0 ? 'disabled title="Remove all devices first"' : ''}>Delete</button>
+                                <div>
+                                    <button class="btn btn-primary btn-sm" onclick="showRenameCategoryModal('${c.id}', '${c.name}')" style="margin-right:5px">Rename</button>
+                                    <button class="btn btn-danger btn-sm" onclick="deleteCategory('${c.id}')" ${catDevices.length > 0 ? 'disabled title="Remove all devices first"' : ''}>Delete</button>
+                                </div>
                             </div>
                             ${c.description ? `<p style="color:#666;margin:5px 0 0 0">${c.description}</p>` : ''}
                             ${deviceRows}
@@ -4995,7 +5055,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                                     <span style="background:${r.type === 'page' ? '#dcfce7' : '#dbeafe'};padding:2px 6px;border-radius:3px;margin-left:10px;font-size:12px">${r.type}</span>
                                     <span style="color:#666;margin-left:10px">${r.timeout}s timeout</span>
                                 </div>
-                                <button class="btn btn-danger btn-sm" onclick="deleteRoom('${r.extension}')">Delete Room</button>
+                                <div>
+                                    <button class="btn btn-primary btn-sm" onclick="showRenameRoomModal('${r.extension}', '${r.name}')" style="margin-right:5px">Rename</button>
+                                    <button class="btn btn-danger btn-sm" onclick="deleteRoom('${r.extension}')">Delete</button>
+                                </div>
                             </div>
                             ${memberRows}
                         </div>
@@ -5056,6 +5119,36 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             }
         }
 
+        // Room rename
+        let renameRoomExt = '';
+        function showRenameRoomModal(ext, currentName) {
+            renameRoomExt = ext;
+            const name = prompt('Enter new name for room ' + ext + ':', currentName);
+            if (name && name.trim()) {
+                renameRoom(ext, name.trim());
+            }
+        }
+
+        async function renameRoom(ext, newName) {
+            try {
+                const res = await fetch(API_BASE + '/rooms/' + ext, {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ name: newName })
+                });
+                const result = await res.json();
+                if (result.success) {
+                    showAlert('Room renamed');
+                    loadRooms();
+                    loadDevices();
+                } else {
+                    showAlert(result.error || 'Failed to rename room', 'error');
+                }
+            } catch (e) {
+                showAlert('Failed to rename room', 'error');
+            }
+        }
+
         // Category modal functions
         function showAddCategoryModal() { document.getElementById('add-category-modal').classList.add('active'); }
         function closeAddCategoryModal() { document.getElementById('add-category-modal').classList.remove('active'); document.getElementById('add-category-form').reset(); }
@@ -5103,6 +5196,34 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 }
             } catch (e) {
                 showAlert('Failed to delete category', 'error');
+            }
+        }
+
+        // Category rename
+        function showRenameCategoryModal(id, currentName) {
+            const name = prompt('Enter new name for category ' + id + ':', currentName);
+            if (name && name.trim()) {
+                renameCategory(id, name.trim());
+            }
+        }
+
+        async function renameCategory(id, newName) {
+            try {
+                const res = await fetch(API_BASE + '/categories/' + id, {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ name: newName })
+                });
+                const result = await res.json();
+                if (result.success) {
+                    showAlert('Category renamed');
+                    loadCategories();
+                    loadDevices();
+                } else {
+                    showAlert(result.error || 'Failed to rename category', 'error');
+                }
+            } catch (e) {
+                showAlert('Failed to rename category', 'error');
             }
         }
 
@@ -5431,6 +5552,38 @@ class WebAdminHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({'success': False, 'error': str(e)}, 400)
             return
 
+        # Rename room: PUT /api/rooms/{ext}
+        room_rename_match = re.match(r'/api/rooms/(\d+)$', path)
+        if room_rename_match:
+            ext = room_rename_match.group(1)
+            try:
+                data = json.loads(body)
+                new_name = data.get('name', '').strip()
+                if not new_name:
+                    self.send_json({'success': False, 'error': 'Name required'}, 400)
+                    return
+                success, msg = rename_room(ext, new_name)
+                self.send_json({'success': success, 'message': msg})
+            except Exception as e:
+                self.send_json({'success': False, 'error': str(e)}, 400)
+            return
+
+        # Rename category: PUT /api/categories/{id}
+        cat_rename_match = re.match(r'/api/categories/([a-z0-9]+)$', path)
+        if cat_rename_match:
+            cat_id = cat_rename_match.group(1)
+            try:
+                data = json.loads(body)
+                new_name = data.get('name', '').strip()
+                if not new_name:
+                    self.send_json({'success': False, 'error': 'Name required'}, 400)
+                    return
+                success, msg = rename_category(cat_id, new_name)
+                self.send_json({'success': success, 'message': msg})
+            except Exception as e:
+                self.send_json({'success': False, 'error': str(e)}, 400)
+            return
+
         self.send_response(404)
         self.end_headers()
 
@@ -5576,35 +5729,59 @@ web_admin_menu() {
             ;;
         2)
             print_info "Stopping web admin..."
+            echo ""
+
+            # Check what's on the port first
+            echo "  $ netstat -tlnp | grep ${WEB_ADMIN_PORT}"
+            netstat -tlnp 2>/dev/null | grep "${WEB_ADMIN_PORT}" || echo "    (nothing found)"
+            echo ""
 
             # First stop attempt
-            echo "  Running: systemctl stop easy-asterisk-webadmin"
-            systemctl stop easy-asterisk-webadmin 2>/dev/null || true
+            echo "  $ systemctl stop easy-asterisk-webadmin"
+            systemctl stop easy-asterisk-webadmin 2>&1 || true
             sleep 1
 
-            # Check if port is still in use
-            if lsof -ti ":${WEB_ADMIN_PORT}" >/dev/null 2>&1; then
-                echo "  Port ${WEB_ADMIN_PORT} still in use, stopping again..."
-                systemctl stop easy-asterisk-webadmin 2>/dev/null || true
+            # Check port again
+            echo ""
+            echo "  $ netstat -tlnp | grep ${WEB_ADMIN_PORT}"
+            netstat -tlnp 2>/dev/null | grep "${WEB_ADMIN_PORT}" || echo "    (nothing found)"
+
+            # If still in use, stop again
+            if netstat -tlnp 2>/dev/null | grep -q ":${WEB_ADMIN_PORT}"; then
+                echo ""
+                echo "  Port still in use, running stop again..."
+                echo "  $ systemctl stop easy-asterisk-webadmin"
+                systemctl stop easy-asterisk-webadmin 2>&1 || true
                 sleep 1
+
+                echo ""
+                echo "  $ netstat -tlnp | grep ${WEB_ADMIN_PORT}"
+                netstat -tlnp 2>/dev/null | grep "${WEB_ADMIN_PORT}" || echo "    (nothing found)"
             fi
 
-            # If still in use, kill directly
-            local port_pids=$(lsof -ti ":${WEB_ADMIN_PORT}" 2>/dev/null)
-            if [[ -n "$port_pids" ]]; then
-                echo "  Killing remaining processes on port ${WEB_ADMIN_PORT}..."
-                echo "$port_pids" | xargs kill -9 2>/dev/null || true
-                sleep 1
+            # If STILL in use, kill processes
+            if netstat -tlnp 2>/dev/null | grep -q ":${WEB_ADMIN_PORT}"; then
+                echo ""
+                echo "  Still in use, killing processes..."
+                local pid=$(netstat -tlnp 2>/dev/null | grep ":${WEB_ADMIN_PORT}" | awk '{print $7}' | cut -d'/' -f1 | head -1)
+                if [[ -n "$pid" ]]; then
+                    echo "  $ kill -9 $pid"
+                    kill -9 "$pid" 2>&1 || true
+                    sleep 1
+                fi
             fi
 
             # Disable the service
             systemctl disable easy-asterisk-webadmin 2>/dev/null || true
 
             # Final verification
-            if lsof -ti ":${WEB_ADMIN_PORT}" >/dev/null 2>&1; then
+            echo ""
+            echo "  Final check:"
+            echo "  $ netstat -tlnp | grep ${WEB_ADMIN_PORT}"
+            if netstat -tlnp 2>/dev/null | grep ":${WEB_ADMIN_PORT}"; then
                 print_error "Port ${WEB_ADMIN_PORT} still in use!"
-                lsof -i ":${WEB_ADMIN_PORT}" 2>/dev/null
             else
+                echo "    (nothing found)"
                 print_success "Web Admin stopped"
             fi
             ;;
