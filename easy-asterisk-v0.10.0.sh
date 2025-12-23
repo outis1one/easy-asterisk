@@ -4399,6 +4399,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .btn-primary { background: var(--primary); color: white; }
         .btn-danger { background: var(--danger); color: white; }
         .btn-sm { padding: 4px 10px; font-size: 0.8rem; }
+        .action-select { width: 95px; padding: 5px 4px; font-size: 12px; border: 1px solid #ccc; border-radius: 4px; }
+        .action-btn { width: 65px; padding: 5px 4px; font-size: 12px; }
+        .sort-control { display: flex; align-items: center; gap: 8px; }
+        .sort-control label { font-size: 13px; color: #666; }
+        .sort-control select { padding: 5px 8px; font-size: 13px; border: 1px solid #ccc; border-radius: 4px; }
         .form-group { margin-bottom: 15px; }
         .form-group label { display: block; margin-bottom: 5px; font-weight: 500; }
         .form-control {
@@ -4482,7 +4487,17 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="card">
                 <div class="card-header">
                     <h2>Registered Devices</h2>
-                    <div>
+                    <div style="display:flex;align-items:center;gap:15px">
+                        <div class="sort-control">
+                            <label>Sort by:</label>
+                            <select id="sort-select" onchange="sortDevices(this.value)">
+                                <option value="extension">Extension</option>
+                                <option value="name">Name</option>
+                                <option value="category">Category</option>
+                                <option value="status">Status (Online first)</option>
+                                <option value="transport">Transport</option>
+                            </select>
+                        </div>
                         <button class="refresh-btn" onclick="loadDevices()" title="Refresh">&#x21bb;</button>
                         <button class="btn btn-primary" onclick="showAddModal()">+ Add Device</button>
                     </div>
@@ -4692,6 +4707,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         let roomsCache = [];
         let categoriesCache = [];
         let devicesCache = [];
+        let statusCache = {};
+        let currentSort = 'extension';
 
         // Tab switching
         document.querySelectorAll('.tab').forEach(tab => {
@@ -4723,6 +4740,59 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             ).join('');
         }
 
+        function sortDevices(sortBy) {
+            currentSort = sortBy;
+            renderDevices();
+        }
+
+        function getSortedDevices() {
+            const devices = [...devicesCache];
+            switch (currentSort) {
+                case 'extension':
+                    return devices.sort((a, b) => parseInt(a.extension) - parseInt(b.extension));
+                case 'name':
+                    return devices.sort((a, b) => a.name.localeCompare(b.name));
+                case 'category':
+                    return devices.sort((a, b) => a.category.localeCompare(b.category));
+                case 'status':
+                    return devices.sort((a, b) => {
+                        const aOnline = statusCache[a.extension] === 'online' ? 0 : 1;
+                        const bOnline = statusCache[b.extension] === 'online' ? 0 : 1;
+                        return aOnline - bOnline || parseInt(a.extension) - parseInt(b.extension);
+                    });
+                case 'transport':
+                    return devices.sort((a, b) => a.transport.localeCompare(b.transport));
+                default:
+                    return devices;
+            }
+        }
+
+        function renderDevices() {
+            const devices = getSortedDevices();
+            const tbody = document.getElementById('devices-table');
+            tbody.innerHTML = devices.map(d => `
+                <tr>
+                    <td><strong>${d.extension}</strong></td>
+                    <td>${d.name}</td>
+                    <td>${d.category}</td>
+                    <td>${d.transport.toUpperCase()}</td>
+                    <td><span class="status status-${statusCache[d.extension] || 'offline'}">${statusCache[d.extension] || 'offline'}</span></td>
+                    <td style="white-space:nowrap">
+                        <select class="action-select" onchange="addToRoom('${d.extension}', this.value); this.selectedIndex=0;">
+                            <option value="">Room...</option>
+                            ${getRoomOptions(d.extension)}
+                        </select>
+                        <select class="action-select" onchange="changeCategory('${d.extension}', this.value); this.selectedIndex=0;">
+                            <option value="">Category...</option>
+                            ${getCategoryOptions(d.category)}
+                        </select>
+                        <button class="btn btn-primary action-btn" onclick="showRenameModal('${d.extension}', '${d.name}')">Rename</button>
+                        <button class="btn btn-danger action-btn" onclick="deleteDevice('${d.extension}', '${d.name}')">Delete</button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
         async function loadDevices() {
             try {
                 const [devicesRes, statusRes, roomsRes, catRes] = await Promise.all([
@@ -4732,36 +4802,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     fetch(API_BASE + '/categories')
                 ]);
                 const devices = await devicesRes.json();
-                const status = await statusRes.json();
+                statusCache = await statusRes.json();
                 roomsCache = await roomsRes.json();
                 categoriesCache = await catRes.json();
 
-                // Sort by extension
-                devices.sort((a, b) => parseInt(a.extension) - parseInt(b.extension));
                 devicesCache = devices;
-
-                const tbody = document.getElementById('devices-table');
-                tbody.innerHTML = devices.map(d => `
-                    <tr>
-                        <td><strong>${d.extension}</strong></td>
-                        <td>${d.name}</td>
-                        <td>${d.category}</td>
-                        <td>${d.transport.toUpperCase()}</td>
-                        <td><span class="status status-${status[d.extension] || 'offline'}">${status[d.extension] || 'offline'}</span></td>
-                        <td style="white-space:nowrap">
-                            <select onchange="addToRoom('${d.extension}', this.value); this.selectedIndex=0;" style="padding:4px;margin-right:3px;font-size:12px">
-                                <option value="">Room...</option>
-                                ${getRoomOptions(d.extension)}
-                            </select>
-                            <select onchange="changeCategory('${d.extension}', this.value); this.selectedIndex=0;" style="padding:4px;margin-right:3px;font-size:12px">
-                                <option value="">Category...</option>
-                                ${getCategoryOptions(d.category)}
-                            </select>
-                            <button class="btn btn-primary btn-sm" onclick="showRenameModal('${d.extension}', '${d.name}')" style="margin-right:3px">Rename</button>
-                            <button class="btn btn-danger btn-sm" onclick="deleteDevice('${d.extension}', '${d.name}')">Delete</button>
-                        </td>
-                    </tr>
-                `).join('');
+                renderDevices();
 
                 // Update category select in add device form
                 document.getElementById('category-select').innerHTML = categoriesCache.map(c =>
