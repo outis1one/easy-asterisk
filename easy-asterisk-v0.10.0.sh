@@ -4672,11 +4672,10 @@ web_admin_menu() {
 
     case $choice in
         1)
-            if [[ ! -f "$WEB_ADMIN_SCRIPT" ]]; then
-                print_info "Installing web admin..."
-                create_web_admin_script
-                create_web_admin_service
-            fi
+            # Always regenerate script to ensure latest version
+            print_info "Installing/updating web admin..."
+            create_web_admin_script
+            create_web_admin_service
             if [[ ! -f "$WEB_ADMIN_HTPASSWD" ]]; then
                 setup_web_admin_auth
             fi
