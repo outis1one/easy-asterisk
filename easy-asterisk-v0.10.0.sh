@@ -3841,7 +3841,12 @@ def get_devices():
             devices[-1]['transport'] = line.split('transport-')[1]
         elif devices and line.startswith('media_encryption='):
             val = line.split('=')[1]
-            if val != 'no':
+            if val == 'sdes' or val == 'dtls':
+                devices[-1]['encryption'] = val
+                # If encryption is set but no explicit transport, assume TLS
+                if devices[-1]['transport'] == 'udp':
+                    devices[-1]['transport'] = 'tls'
+            elif val != 'no':
                 devices[-1]['encryption'] = val
 
     return devices
@@ -3929,6 +3934,79 @@ def delete_device(extension):
             f.writelines(new_lines)
         subprocess.run(['asterisk', '-rx', 'pjsip reload'], capture_output=True)
         return True, "Device deleted"
+    return False, "Device not found"
+
+def rename_device(extension, new_name):
+    """Rename a device in pjsip.conf"""
+    if not os.path.exists(PJSIP_CONF):
+        return False, "Config file not found"
+
+    with open(PJSIP_CONF, 'r') as f:
+        lines = f.readlines()
+
+    new_lines = []
+    found = False
+    in_device = False
+    device_ext = None
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Match device comment and update name
+        if stripped.startswith('; === Device:'):
+            # Parse the comment to get category and AA tag
+            temp = stripped.split('; === Device:')[1].split('===')[0].strip()
+            aa_tag = ''
+            if '[AA:yes]' in temp:
+                aa_tag = ' [AA:yes]'
+                temp = temp.replace('[AA:yes]', '').strip()
+            elif '[AA:no]' in temp:
+                aa_tag = ' [AA:no]'
+                temp = temp.replace('[AA:no]', '').strip()
+
+            if '(' in temp:
+                cat = temp[temp.rfind('(')+1:temp.rfind(')')]
+            else:
+                cat = 'unknown'
+
+            # Store for next line check
+            pending_comment = (line, cat, aa_tag)
+            continue
+
+        # Check if this is the extension we want
+        if 'pending_comment' in dir() and pending_comment:
+            match = re.match(r'^\[(\d+)\]$', stripped)
+            if match and match.group(1) == extension:
+                # This is our device - write updated comment
+                old_line, cat, aa_tag = pending_comment
+                new_lines.append(f'; === Device: {new_name} ({cat}){aa_tag} ===\n')
+                new_lines.append(line)
+                found = True
+                in_device = True
+                device_ext = extension
+                pending_comment = None
+                continue
+            else:
+                # Not our device, write original comment
+                new_lines.append(pending_comment[0])
+                pending_comment = None
+
+        # Update callerid line
+        if in_device and stripped.startswith('callerid='):
+            new_lines.append(f'callerid="{new_name}" <{device_ext}>\n')
+            continue
+
+        # Reset on empty line after device
+        if in_device and stripped == '':
+            in_device = False
+
+        new_lines.append(line)
+
+    if found:
+        with open(PJSIP_CONF, 'w') as f:
+            f.writelines(new_lines)
+        subprocess.run(['asterisk', '-rx', 'pjsip reload'], capture_output=True)
+        return True, "Device renamed"
     return False, "Device not found"
 
 def generate_password(length=16):
@@ -4323,6 +4401,27 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- Rename Modal -->
+    <div id="rename-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Rename Device</h3>
+                <p>Enter a new name for extension <span id="rename-ext"></span></p>
+            </div>
+            <form id="rename-form" onsubmit="renameDevice(event)">
+                <input type="hidden" id="rename-extension" name="extension">
+                <div class="form-group">
+                    <label>New Name</label>
+                    <input type="text" id="rename-name" name="name" class="form-control" required>
+                </div>
+                <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;">
+                    <button type="button" class="btn" onclick="closeRenameModal()" style="background: #e2e8f0;">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Rename</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <script>
         const API_BASE = '/api';
 
@@ -4360,6 +4459,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         <td>${d.transport.toUpperCase()}</td>
                         <td><span class="status status-${status[d.extension] || 'offline'}">${status[d.extension] || 'offline'}</span></td>
                         <td>
+                            <button class="btn btn-primary btn-sm" onclick="showRenameModal('${d.extension}', '${d.name}')" style="margin-right:5px">Rename</button>
                             <button class="btn btn-danger btn-sm" onclick="deleteDevice('${d.extension}', '${d.name}')">Delete</button>
                         </td>
                     </tr>
@@ -4477,6 +4577,43 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             }
         }
 
+        function showRenameModal(ext, currentName) {
+            document.getElementById('rename-ext').textContent = ext;
+            document.getElementById('rename-extension').value = ext;
+            document.getElementById('rename-name').value = currentName;
+            document.getElementById('rename-modal').classList.add('active');
+        }
+
+        function closeRenameModal() {
+            document.getElementById('rename-modal').classList.remove('active');
+            document.getElementById('rename-form').reset();
+        }
+
+        async function renameDevice(e) {
+            e.preventDefault();
+            const ext = document.getElementById('rename-extension').value;
+            const newName = document.getElementById('rename-name').value;
+
+            try {
+                const res = await fetch(API_BASE + '/devices/' + ext, {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ name: newName })
+                });
+                const result = await res.json();
+
+                if (result.success) {
+                    closeRenameModal();
+                    showAlert('Device renamed');
+                    loadDevices();
+                } else {
+                    showAlert(result.error || 'Failed to rename', 'error');
+                }
+            } catch (e) {
+                showAlert('Failed to rename device', 'error');
+            }
+        }
+
         // Initial load
         loadDevices();
         loadCategories();
@@ -4578,6 +4715,32 @@ class WebAdminHandler(http.server.BaseHTTPRequestHandler):
             ext = match.group(1)
             success, msg = delete_device(ext)
             self.send_json({'success': success, 'message': msg})
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_PUT(self):
+        if not check_auth(self.headers):
+            self.send_auth_required()
+            return
+
+        path = urlparse(self.path).path
+        match = re.match(r'/api/devices/(\d+)', path)
+
+        if match:
+            ext = match.group(1)
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8')
+            try:
+                data = json.loads(body)
+                new_name = data.get('name', '').strip()
+                if not new_name:
+                    self.send_json({'success': False, 'error': 'Name required'}, 400)
+                    return
+                success, msg = rename_device(ext, new_name)
+                self.send_json({'success': success, 'message': msg})
+            except Exception as e:
+                self.send_json({'success': False, 'error': str(e)}, 400)
         else:
             self.send_response(404)
             self.end_headers()
@@ -4702,16 +4865,36 @@ web_admin_menu() {
             fi
             ;;
         2)
-            systemctl stop easy-asterisk-webadmin 2>/dev/null
-            systemctl disable easy-asterisk-webadmin 2>/dev/null
-            # Kill any remaining processes
-            pkill -f "easy-asterisk-webadmin" 2>/dev/null || true
+            print_info "Stopping web admin..."
+            systemctl stop easy-asterisk-webadmin 2>/dev/null || true
+            systemctl disable easy-asterisk-webadmin 2>/dev/null || true
             sleep 1
+            # Kill any Python processes running the webadmin script
+            if pgrep -f "${WEB_ADMIN_SCRIPT}" >/dev/null 2>&1; then
+                print_info "Killing remaining processes..."
+                pkill -f "${WEB_ADMIN_SCRIPT}" 2>/dev/null || true
+                sleep 1
+            fi
             # Force kill if still running
-            pkill -9 -f "easy-asterisk-webadmin" 2>/dev/null || true
-            # Release the port if still held
-            fuser -k "${WEB_ADMIN_PORT}/tcp" 2>/dev/null || true
-            print_success "Web Admin stopped"
+            if pgrep -f "${WEB_ADMIN_SCRIPT}" >/dev/null 2>&1; then
+                print_info "Force killing..."
+                pkill -9 -f "${WEB_ADMIN_SCRIPT}" 2>/dev/null || true
+                sleep 1
+            fi
+            # Kill anything on the port
+            if command -v fuser &>/dev/null; then
+                fuser -k "${WEB_ADMIN_PORT}/tcp" 2>/dev/null || true
+            elif command -v lsof &>/dev/null; then
+                local pid=$(lsof -ti ":${WEB_ADMIN_PORT}" 2>/dev/null)
+                [[ -n "$pid" ]] && kill -9 $pid 2>/dev/null || true
+            fi
+            # Verify stopped
+            sleep 1
+            if pgrep -f "${WEB_ADMIN_SCRIPT}" >/dev/null 2>&1; then
+                print_error "Process still running. Try: sudo pkill -9 -f easy-asterisk-webadmin"
+            else
+                print_success "Web Admin stopped"
+            fi
             ;;
         3)
             systemctl restart easy-asterisk-webadmin
