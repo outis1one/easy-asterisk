@@ -11,12 +11,15 @@
 # - FIXED: Extension renaming now preserves AA tags correctly
 # - FIXED: LAN/VPN devices now explicitly use UDP transport (prevents TLS fallback)
 # - FIXED: LAN devices now have media_encryption=no to prevent SRTP issues
+# - FIXED: VPN subnets now included as local_net in LAN mode (fixes VPN mobile offline)
+# - FIXED: One-way audio on WiFi-to-mobile-data handoff (rtp_keepalive + timers)
 # - ADDED: Web Admin interface for browser-based client management
 #   - View device status (online/offline) in real-time
 #   - Add/delete devices via web interface
 #   - View rooms and categories
 #   - HTTP Basic authentication with SHA256 password hashing
 #   - Access at http://server:8080/clients
+# - ADDED: VPN subnet auto-detection (Tailscale, WireGuard, OpenVPN)
 # - IMPROVED: Device deletion uses awk for reliable multi-section removal
 # - IMPROVED: Device renaming uses awk to handle all edge cases
 #
@@ -649,6 +652,15 @@ add_device_menu() {
 
     backup_config "/etc/asterisk/pjsip.conf"
 
+    # Mobile devices benefit from keepalive to maintain NAT mappings
+    # during WiFi/mobile data transitions
+    local keepalive_block=""
+    if [[ "$cat_id" == "mobile" ]]; then
+        keepalive_block="rtp_keepalive=15
+rtp_timeout=120
+rtp_timeout_hold=120"
+    fi
+
     cat >> /etc/asterisk/pjsip.conf << EOF
 
 ; === Device: $name ($cat_id) $override_tag ===
@@ -666,6 +678,7 @@ direct_media=no
 rtp_symmetric=yes
 force_rport=yes
 rewrite_contact=yes
+${keepalive_block}
 ${ice_block}
 auth=${ext}
 aors=${ext}
@@ -681,7 +694,7 @@ password=${pass}
 type=aor
 max_contacts=5
 remove_existing=yes
-qualify_frequency=60
+qualify_frequency=30
 EOF
 
     chown -R asterisk:asterisk /etc/asterisk 2>/dev/null || true
@@ -1494,35 +1507,81 @@ verify_cidr_config() {
 }
 
 configure_vlan_subnets() {
-    print_header "VLAN Configuration"
+    print_header "VLAN / VPN Subnet Configuration"
     load_config
 
-    echo "VLAN Support for Asterisk Easy"
+    echo "Additional Subnet Support for Easy Asterisk"
     echo "================================================"
     echo ""
-    echo "If your network uses VLANs (Virtual LANs), you need to"
-    echo "tell Asterisk about all the local subnets to prevent"
-    echo "calls from dropping after 30 seconds."
+    echo "If your network uses VLANs or VPNs, you need to tell"
+    echo "Asterisk about all the local subnets so that:"
+    echo "  - Calls don't drop after 30 seconds (VLAN issue)"
+    echo "  - VPN-connected mobile devices can register"
+    echo "  - Audio works correctly for VPN users"
     echo ""
     echo "Example subnets:"
     echo "  192.168.1.0/24    - Main network"
     echo "  192.168.10.0/24   - IoT VLAN"
-    echo "  192.168.20.0/24   - Guest VLAN"
-    echo "  10.0.0.0/8        - Large private network"
+    echo "  100.64.0.0/10     - Tailscale VPN"
+    echo "  10.0.0.0/8        - WireGuard/OpenVPN"
     echo ""
 
-    read -p "Does your network use VLANs? (y/n) [${HAS_VLANS}]: " has_vlans
+    # Auto-detect VPN interfaces and their subnets
+    local detected_vpn_subnets=""
+    local vpn_info=""
+    while IFS= read -r line; do
+        local iface=$(echo "$line" | awk '{print $2}' | tr -d ':')
+        local addr=$(echo "$line" | awk '{print $4}')
+        if [[ -n "$addr" && -n "$iface" ]]; then
+            case "$iface" in
+                tailscale*|ts*)
+                    vpn_info="${vpn_info}  Detected: ${iface} -> ${addr} (Tailscale)\n"
+                    detected_vpn_subnets="${detected_vpn_subnets} 100.64.0.0/10"
+                    ;;
+                wg*)
+                    vpn_info="${vpn_info}  Detected: ${iface} -> ${addr} (WireGuard)\n"
+                    detected_vpn_subnets="${detected_vpn_subnets} ${addr}"
+                    ;;
+                tun*|tap*)
+                    vpn_info="${vpn_info}  Detected: ${iface} -> ${addr} (OpenVPN/VPN tunnel)\n"
+                    detected_vpn_subnets="${detected_vpn_subnets} ${addr}"
+                    ;;
+                nordlynx*|proton*)
+                    vpn_info="${vpn_info}  Detected: ${iface} -> ${addr} (VPN)\n"
+                    detected_vpn_subnets="${detected_vpn_subnets} ${addr}"
+                    ;;
+            esac
+        fi
+    done < <(ip -o -f inet addr show 2>/dev/null | grep -vE 'lo |docker|br-|veth')
+    detected_vpn_subnets=$(echo "$detected_vpn_subnets" | xargs -n1 2>/dev/null | sort -u | xargs 2>/dev/null)
+
+    if [[ -n "$vpn_info" ]]; then
+        echo -e "${GREEN}VPN interfaces detected on this server:${NC}"
+        echo -e "$vpn_info"
+        echo "  Suggested VPN subnets: ${detected_vpn_subnets}"
+        echo ""
+        echo "  NOTE: If mobile devices connect via VPN (e.g., Tailscale on phones),"
+        echo "  you MUST add the VPN subnet here for them to reach Asterisk."
+        echo ""
+    fi
+
+    read -p "Does your network use VLANs or VPNs? (y/n) [${HAS_VLANS}]: " has_vlans
     has_vlans=${has_vlans:-$HAS_VLANS}
 
     if [[ "$has_vlans" =~ ^[Yy] ]]; then
         HAS_VLANS="y"
         echo ""
-        echo "Current VLAN Subnets: ${VLAN_SUBNETS:-none}"
+        echo "Current Subnets: ${VLAN_SUBNETS:-none}"
+        if [[ -n "$detected_vpn_subnets" ]]; then
+            echo "Detected VPN Subnets: ${detected_vpn_subnets}"
+        fi
         echo ""
-        echo "Enter VLAN subnets in CIDR notation, separated by spaces."
-        echo "Example: 192.168.1.0/24 192.168.10.0/24 192.168.20.0/24"
+        echo "Enter ALL additional subnets (VLAN + VPN) in CIDR notation, separated by spaces."
+        echo "Example: 192.168.10.0/24 100.64.0.0/10"
         echo ""
-        read -p "VLAN Subnets: " vlan_input
+        local default_subnets="${VLAN_SUBNETS:-$detected_vpn_subnets}"
+        read -p "Subnets [${default_subnets}]: " vlan_input
+        vlan_input="${vlan_input:-$default_subnets}"
 
         if [[ -n "$vlan_input" ]]; then
             VLAN_SUBNETS="$vlan_input"
@@ -2841,10 +2900,17 @@ local_net=${vlan_subnet}"
 
     local nat_settings=""
     if [[ -n "$public_ip" && -n "$DOMAIN_NAME" ]]; then
+        # FQDN mode: full NAT settings with external addresses
         nat_settings="external_media_address=$public_ip
 external_signaling_address=$public_ip
 ${all_local_nets}"
         print_info "NAT: Public IP=$public_ip, Server IP=$server_ip"
+    elif [[ "$HAS_VLANS" == "y" && -n "$VLAN_SUBNETS" ]]; then
+        # LAN/VPN mode with VLAN/VPN subnets: include local_net entries
+        # so Asterisk recognizes VPN traffic as local (prevents VPN devices
+        # appearing offline and fixes media routing for VPN-connected mobiles)
+        nat_settings="${all_local_nets}"
+        print_info "LAN mode with additional subnets: $VLAN_SUBNETS"
     fi
 
     cat > "$conf_file" << EOF
@@ -4312,6 +4378,11 @@ def add_device(name, category, extension, conn_type='lan', auto_answer=None):
     elif auto_answer == 'no':
         aa_tag = '[AA:no] '
 
+    # Mobile devices get keepalive settings for NAT traversal
+    keepalive = ''
+    if category == 'mobile':
+        keepalive = 'rtp_keepalive=15\nrtp_timeout=120\nrtp_timeout_hold=120'
+
     device_config = f'''
 ; === Device: {name} ({category}) {aa_tag}===
 [{extension}]
@@ -4328,6 +4399,7 @@ direct_media=no
 rtp_symmetric=yes
 force_rport=yes
 rewrite_contact=yes
+{keepalive}
 {ice}
 auth={extension}
 aors={extension}
@@ -4343,7 +4415,7 @@ password={password}
 type=aor
 max_contacts=5
 remove_existing=yes
-qualify_frequency=60
+qualify_frequency=30
 '''
 
     with open(PJSIP_CONF, 'a') as f:
@@ -5878,7 +5950,7 @@ submenu_server() {
     echo "  6) Verify CIDR/NAT config"
     echo "  7) Watch Live Logs"
     echo "  8) Router Doctor"
-    echo "  9) Configure VLAN Subnets"
+    echo "  9) Configure VLAN/VPN Subnets"
     echo " 10) Provisioning Manager"
     echo " 11) Web Admin (Client Management)"
     echo "  0) Back"
