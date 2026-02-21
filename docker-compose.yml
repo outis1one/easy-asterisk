@@ -2,15 +2,13 @@
 # Easy Asterisk - Docker Compose
 #
 # Usage:
-#   docker compose up -d                      # Asterisk only
-#   docker compose --profile stun up -d       # Asterisk + self-hosted STUN
-#   docker exec -it easy-asterisk easy-asterisk   # Interactive management
+#   docker compose up -d                     # Start everything
+#   docker exec -it easy-asterisk easy-asterisk  # Interactive management
 #   docker exec -it easy-asterisk vpn-diagnostics # VPN diagnostics
-#   docker exec -it easy-asterisk dns-whitelist   # DNS whitelist check
 #
-# For third-party VPNs with DNS filtering:
-#   Use --profile stun to run a self-hosted STUN server
-#   This eliminates all external DNS dependencies
+# All clients connect via FQDN (TLS) regardless of their network.
+# coturn provides STUN (NAT detection) + TURN (media relay) so calls
+# work even behind strict firewalls, cellular NAT, or VPNs like Proton.
 # ================================================================
 
 services:
@@ -21,9 +19,12 @@ services:
     container_name: easy-asterisk
     # Host networking required for:
     #   - RTP media ports (10000-20000 UDP) - too many to map individually
-    #   - VPN interface access (tun/tap/wg devices)
     #   - Proper NAT detection and SIP Contact headers
+    #   - Direct access to coturn on localhost
     network_mode: host
+    depends_on:
+      coturn:
+        condition: service_healthy
     volumes:
       - asterisk-config:/etc/asterisk
       - easy-asterisk-config:/etc/easy-asterisk
@@ -31,28 +32,32 @@ services:
       - asterisk-spool:/var/spool/asterisk
       - asterisk-lib:/var/lib/asterisk
     environment:
-      # ── Network Mode ──
-      # Leave DOMAIN_NAME empty for LAN/VPN mode (recommended)
-      - DOMAIN_NAME=${DOMAIN_NAME:-}
-      - ENABLE_TLS=${ENABLE_TLS:-n}
+      # ── Domain (REQUIRED for remote access) ──
+      # Your FQDN that points to this server's public IP
+      - DOMAIN_NAME=${DOMAIN_NAME:?Set DOMAIN_NAME in .env}
+      - ENABLE_TLS=${ENABLE_TLS:-y}
+
+      # ── Public IP ──
+      # Auto-detected if empty. Set manually if detection fails.
+      - PUBLIC_IP=${PUBLIC_IP:-}
+
+      # ── Local Network ──
       - LOCAL_CIDR=${LOCAL_CIDR:-}
 
-      # ── VPN Configuration ──
-      # Add your VPN subnet(s) here, space-separated
-      # Example: 10.8.0.0/24 or 100.64.0.0/10 (Tailscale)
+      # ── Additional Subnets ──
+      # Space-separated CIDRs for VLANs, site-to-site VPNs, etc.
+      # NOT needed for client-side VPNs (Proton, NordVPN) - TURN handles those
       - HAS_VLANS=${HAS_VLANS:-n}
       - VLAN_SUBNETS=${VLAN_SUBNETS:-}
 
-      # ── STUN Server ──
-      # For self-hosted coturn: use your server's VPN/LAN IP + port 3478
-      # Example: STUN_SERVER=10.8.0.1:3478
-      # Leave empty to disable STUN (fine if VPN provides direct routing)
-      - STUN_SERVER=${STUN_SERVER:-}
-      - VPN_ICE_ENABLED=${VPN_ICE_ENABLED:-n}
-      - CUSTOM_STUN_SERVER=${CUSTOM_STUN_SERVER:-}
+      # ── TURN/STUN Server ──
+      # Points to the coturn service (auto-configured)
+      - TURN_ENABLED=y
+      - TURN_SERVER=${DOMAIN_NAME:?}:3478
+      - TURN_USERNAME=${TURN_USERNAME:-easyasterisk}
+      - TURN_PASSWORD=${TURN_PASSWORD:-}
 
       # ── RTP Port Range ──
-      # Reduce range for constrained environments
       - RTP_START=${RTP_START:-10000}
       - RTP_END=${RTP_END:-20000}
 
@@ -66,36 +71,35 @@ services:
       timeout: 5s
       retries: 3
 
-  # ── Self-Hosted STUN Server (coturn) ───────────────────────
-  # Activate with: docker compose --profile stun up -d
+  # ── TURN/STUN Relay Server (coturn) ──────────────────────────
+  # Provides:
+  #   STUN - Tells clients their public IP (NAT detection)
+  #   TURN - Relays media when direct UDP paths are blocked
+  #          (corporate firewalls, cellular NAT, Proton VPN, etc.)
   #
-  # Why self-hosted STUN?
-  #   - No external DNS dependencies (critical for DNS-filtered networks)
-  #   - STUN reached by IP address, not hostname
-  #   - Faster response than public STUN servers
-  #   - Works entirely within your VPN network
-  #
-  # After starting, set STUN_SERVER to your server's IP:3478
-  # in the .env file and restart the asterisk container.
+  # Without TURN, calls work "sometimes" - with TURN, they always work.
   coturn:
     image: coturn/coturn:latest
-    container_name: easy-asterisk-stun
+    container_name: easy-asterisk-coturn
     network_mode: host
-    command: >
-      -n
-      --no-auth
-      --no-tls
-      --no-dtls
-      --stun-only
-      --listening-port=3478
-      --fingerprint
-      --no-cli
-      --no-multicast-peers
-      --no-loopback-peers
-      --log-file=stdout
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        # Build coturn arguments
+        ARGS="-n --listening-port=3478 --fingerprint --lt-cred-mech"
+        ARGS="$$ARGS --user=${TURN_USERNAME:-easyasterisk}:${TURN_PASSWORD:-changeme}"
+        ARGS="$$ARGS --realm=${DOMAIN_NAME:-localhost}"
+        ARGS="$$ARGS --min-port=${TURN_RELAY_MIN:-49152}"
+        ARGS="$$ARGS --max-port=${TURN_RELAY_MAX:-49252}"
+        # Only add external-ip if PUBLIC_IP is set
+        if [ -n "${PUBLIC_IP:-}" ]; then
+          ARGS="$$ARGS --external-ip=${PUBLIC_IP}"
+        fi
+        ARGS="$$ARGS --no-tls --no-dtls --no-cli"
+        ARGS="$$ARGS --no-multicast-peers --no-loopback-peers"
+        ARGS="$$ARGS --log-file=stdout"
+        exec turnserver $$ARGS
     restart: unless-stopped
-    profiles:
-      - stun
     healthcheck:
       test: ["CMD-SHELL", "ss -uln | grep -q ':3478'"]
       interval: 30s

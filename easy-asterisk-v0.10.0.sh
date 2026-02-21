@@ -283,6 +283,10 @@ load_config() {
     WEB_ADMIN_AUTH_DISABLED="${WEB_ADMIN_AUTH_DISABLED:-false}"
     VPN_ICE_ENABLED="${VPN_ICE_ENABLED:-n}"
     CUSTOM_STUN_SERVER="${CUSTOM_STUN_SERVER:-}"
+    TURN_ENABLED="${TURN_ENABLED:-n}"
+    TURN_SERVER="${TURN_SERVER:-}"
+    TURN_USERNAME="${TURN_USERNAME:-}"
+    TURN_PASSWORD="${TURN_PASSWORD:-}"
     return 0
 }
 
@@ -322,6 +326,10 @@ WEB_ADMIN_PORT="$WEB_ADMIN_PORT"
 WEB_ADMIN_AUTH_DISABLED="$WEB_ADMIN_AUTH_DISABLED"
 VPN_ICE_ENABLED="$VPN_ICE_ENABLED"
 CUSTOM_STUN_SERVER="$CUSTOM_STUN_SERVER"
+TURN_ENABLED="$TURN_ENABLED"
+TURN_SERVER="$TURN_SERVER"
+TURN_USERNAME="$TURN_USERNAME"
+TURN_PASSWORD="$TURN_PASSWORD"
 EOF
     chmod 644 "$CONFIG_FILE"
 
@@ -736,46 +744,79 @@ add_device_menu() {
     local display_transport="UDP"
     local display_encryption="None"
 
-    echo ""
-    echo "═══════════════════════════════════════════════════════════════"
-    echo -e "  HOW WILL THIS DEVICE CONNECT?"
-    echo "═══════════════════════════════════════════════════════════════"
-    echo ""
-    echo -e "  1) ${GREEN}LAN/VPN${NC} - Same network or VPN tunnel (UDP)"
-    if [[ "$ENABLE_TLS" == "y" && -n "$DOMAIN_NAME" ]]; then
-        echo -e "  2) ${CYAN}FQDN${NC} - Internet or cross-VLAN via ${DOMAIN_NAME} (TLS)"
-    else
-        echo -e "  2) ${YELLOW}FQDN${NC} - Not configured (run 'Setup Internet Access' first)"
-    fi
-    echo ""
-    read -p "  Select [1]: " conn_choice
-    conn_choice="${conn_choice:-1}"
+    # In Docker with FQDN: default to FQDN mode for all devices
+    if is_docker && [[ -n "$DOMAIN_NAME" ]]; then
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo -e "  HOW WILL THIS DEVICE CONNECT?"
+        echo "═══════════════════════════════════════════════════════════════"
+        echo ""
+        echo -e "  1) ${CYAN}FQDN (recommended)${NC} - Via ${DOMAIN_NAME} (TLS) - works from any network"
+        echo -e "  2) ${GREEN}LAN only${NC} - Same local network (UDP)"
+        echo ""
+        read -p "  Select [1]: " conn_choice
+        conn_choice="${conn_choice:-1}"
 
-    if [[ "$conn_choice" == "1" ]]; then
-        # LAN/VPN - UDP, no encryption (explicit transport prevents TLS fallback)
-        transport_block="transport=transport-udp"
-        encryption_block="media_encryption=no"
-        display_server="$(hostname -I | awk '{print $1}')"
-        display_port="5060"
-        display_transport="UDP"
-        display_encryption="None"
-        # Enable ICE for VPN devices if VPN ICE mode is active
-        if [[ "$VPN_ICE_ENABLED" == "y" ]]; then
+        if [[ "$conn_choice" == "2" ]]; then
+            transport_block="transport=transport-udp"
+            encryption_block="media_encryption=no"
+            display_server="$(hostname -I | awk '{print $1}')"
+            display_port="5060"
+            display_transport="UDP"
+            display_encryption="None"
             ice_block="ice_support=yes"
+        else
+            conn_type="fqdn"
+            transport_block="transport=transport-tls"
+            encryption_block="media_encryption=sdes"
+            ice_block="ice_support=yes"
+            display_server="$DOMAIN_NAME"
+            display_port="5061"
+            display_transport="TLS"
+            display_encryption="SRTP (SDES)"
         fi
-    elif [[ "$conn_choice" == "2" ]]; then
-        if [[ "$ENABLE_TLS" != "y" || -z "$DOMAIN_NAME" ]]; then
-            print_error "FQDN access not configured. Run 'Setup Internet Access' first."
-            return
+    else
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo -e "  HOW WILL THIS DEVICE CONNECT?"
+        echo "═══════════════════════════════════════════════════════════════"
+        echo ""
+        echo -e "  1) ${GREEN}LAN/VPN${NC} - Same network or VPN tunnel (UDP)"
+        if [[ "$ENABLE_TLS" == "y" && -n "$DOMAIN_NAME" ]]; then
+            echo -e "  2) ${CYAN}FQDN${NC} - Internet or cross-VLAN via ${DOMAIN_NAME} (TLS)"
+        else
+            echo -e "  2) ${YELLOW}FQDN${NC} - Not configured (run 'Setup Internet Access' first)"
         fi
-        conn_type="fqdn"
-        transport_block="transport=transport-tls"
-        encryption_block="media_encryption=sdes"
-        ice_block="ice_support=yes"
-        display_server="$DOMAIN_NAME"
-        display_port="5061"
-        display_transport="TLS"
-        display_encryption="SRTP (SDES)"
+        echo ""
+        read -p "  Select [1]: " conn_choice
+        conn_choice="${conn_choice:-1}"
+
+        if [[ "$conn_choice" == "1" ]]; then
+            # LAN/VPN - UDP, no encryption (explicit transport prevents TLS fallback)
+            transport_block="transport=transport-udp"
+            encryption_block="media_encryption=no"
+            display_server="$(hostname -I | awk '{print $1}')"
+            display_port="5060"
+            display_transport="UDP"
+            display_encryption="None"
+            # Enable ICE for VPN devices if VPN ICE mode is active
+            if [[ "$VPN_ICE_ENABLED" == "y" ]]; then
+                ice_block="ice_support=yes"
+            fi
+        elif [[ "$conn_choice" == "2" ]]; then
+            if [[ "$ENABLE_TLS" != "y" || -z "$DOMAIN_NAME" ]]; then
+                print_error "FQDN access not configured. Run 'Setup Internet Access' first."
+                return
+            fi
+            conn_type="fqdn"
+            transport_block="transport=transport-tls"
+            encryption_block="media_encryption=sdes"
+            ice_block="ice_support=yes"
+            display_server="$DOMAIN_NAME"
+            display_port="5061"
+            display_transport="TLS"
+            display_encryption="SRTP (SDES)"
+        fi
     fi
 
     backup_config "/etc/asterisk/pjsip.conf"
@@ -2989,30 +3030,31 @@ transport=config,pjsip.conf,criteria=type=transport
 EOF
     fi
 
-    # ICE and STUN configuration
+    # ICE / STUN / TURN configuration
     # Enabled for: FQDN/internet mode OR VPN with ICE enabled
     load_config
-    local ice_stun_config=""
-    if [[ -n "$DOMAIN_NAME" ]]; then
-        # FQDN mode: always enable ICE
-        local stun_addr="${CUSTOM_STUN_SERVER:-stun.l.google.com:19302}"
-        ice_stun_config="icesupport=yes
+    local ice_config=""
+    if [[ -n "$DOMAIN_NAME" ]] || [[ "$VPN_ICE_ENABLED" == "y" ]] || [[ "$TURN_ENABLED" == "y" ]]; then
+        local stun_addr="${TURN_SERVER:-${CUSTOM_STUN_SERVER:-stun.l.google.com:19302}}"
+        ice_config="icesupport=yes
 stunaddr=${stun_addr}"
-    elif [[ "$VPN_ICE_ENABLED" == "y" ]]; then
-        # VPN mode with ICE: use custom or self-hosted STUN
-        local stun_addr="${CUSTOM_STUN_SERVER:-stun.l.google.com:19302}"
-        ice_stun_config="icesupport=yes
-stunaddr=${stun_addr}"
+        # Add TURN relay if configured (required for calls through strict NAT/VPN)
+        if [[ "$TURN_ENABLED" == "y" && -n "$TURN_SERVER" && -n "$TURN_USERNAME" && -n "$TURN_PASSWORD" ]]; then
+            ice_config="${ice_config}
+turnaddr=${TURN_SERVER}
+turnusername=${TURN_USERNAME}
+turnpassword=${TURN_PASSWORD}"
+        fi
     else
-        ice_stun_config="# icesupport disabled - LAN only mode"
+        ice_config="# icesupport disabled - LAN only mode"
     fi
 
     cat > /etc/asterisk/rtp.conf << EOF
 [general]
-rtpstart=10000
-rtpend=20000
+rtpstart=${RTP_START:-10000}
+rtpend=${RTP_END:-20000}
 strictrtp=yes
-${ice_stun_config}
+${ice_config}
 EOF
     
     cat > /etc/asterisk/logger.conf << EOF
@@ -3935,7 +3977,11 @@ show_main_menu() {
             echo -e "    Web Admin: ${YELLOW}Stopped${NC}"
         fi
         [[ -n "$DOMAIN_NAME" ]] && echo -e "    Domain: ${DOMAIN_NAME}"
-        [[ "$VPN_ICE_ENABLED" == "y" ]] && echo -e "    VPN ICE: ${GREEN}Enabled${NC} (${CUSTOM_STUN_SERVER:-auto})"
+        if [[ "$TURN_ENABLED" == "y" ]]; then
+            echo -e "    TURN:       ${GREEN}Enabled${NC} (${TURN_SERVER:-auto})"
+        elif [[ "$VPN_ICE_ENABLED" == "y" ]]; then
+            echo -e "    STUN/ICE:   ${GREEN}Enabled${NC} (${CUSTOM_STUN_SERVER:-auto})"
+        fi
         echo ""
 
         declare -A menu_map
@@ -4618,11 +4664,19 @@ def add_device(name, category, extension, conn_type='lan', auto_answer=None):
     # Determine transport and encryption
     # Check if VPN ICE mode is enabled (for third-party VPNs)
     vpn_ice = 'n'
+    turn_enabled = 'n'
+    is_container = os.path.exists('/.dockerenv')
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r') as cf:
             for cline in cf:
                 if cline.startswith('VPN_ICE_ENABLED='):
                     vpn_ice = cline.strip().split('=', 1)[1].strip('"')
+                elif cline.startswith('TURN_ENABLED='):
+                    turn_enabled = cline.strip().split('=', 1)[1].strip('"')
+
+    # In Docker: always use FQDN mode for web-created devices
+    if is_container and conn_type == 'lan':
+        conn_type = 'fqdn'
 
     if conn_type == 'fqdn':
         transport = 'transport=transport-tls'
@@ -4631,7 +4685,7 @@ def add_device(name, category, extension, conn_type='lan', auto_answer=None):
     else:
         transport = 'transport=transport-udp'
         encryption = 'media_encryption=no'
-        ice = 'ice_support=yes' if vpn_ice == 'y' else ''
+        ice = 'ice_support=yes' if (vpn_ice == 'y' or turn_enabled == 'y') else ''
 
     aa_tag = ''
     if auto_answer == 'yes':
