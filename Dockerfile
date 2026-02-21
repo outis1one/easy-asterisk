@@ -6,6 +6,8 @@
 #   docker compose up -d                    # Asterisk only
 #   docker compose --profile stun up -d     # Asterisk + self-hosted STUN
 #   docker exec -it easy-asterisk easy-asterisk  # Interactive management
+#   docker exec -it easy-asterisk vpn-diagnostics # VPN diagnostics
+#   docker exec -it easy-asterisk dns-whitelist   # DNS whitelist check
 # ================================================================
 
 FROM ubuntu:24.04
@@ -13,7 +15,7 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 
-# Install Asterisk and dependencies (matches install_asterisk_packages)
+# Install Asterisk and all dependencies (matches install_asterisk_packages)
 RUN echo "exit 101" > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -30,6 +32,7 @@ RUN echo "exit 101" > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d &&
         dnsutils \
         iputils-ping \
         procps \
+        lsof \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /usr/sbin/policy-rc.d \
     && ldconfig \
@@ -49,6 +52,9 @@ RUN mkdir -p \
         /var/log/asterisk \
         /var/spool/asterisk \
         /var/run/asterisk
+
+# Docker detection marker (used by is_docker() in the script)
+RUN touch /.dockerenv
 
 # Copy the main management script
 COPY easy-asterisk-v0.10.0.sh /usr/local/bin/easy-asterisk
@@ -72,6 +78,9 @@ EXPOSE 5061/tcp
 EXPOSE 8080/tcp
 EXPOSE 8088/tcp
 EXPOSE 8089/tcp
+
+# STUN (if running coturn in same container)
+EXPOSE 3478/udp
 
 # RTP media range (use --network host in production for full range)
 # Docker port-mapping 10000 ports is impractical; host networking recommended

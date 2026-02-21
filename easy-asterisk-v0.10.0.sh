@@ -84,6 +84,113 @@ check_root() {
     fi
 }
 
+# ── Docker / Container Detection ─────────────────────────────
+# Returns 0 (true) if running inside a Docker/container environment
+
+is_docker() {
+    [[ -f /.dockerenv ]] || grep -qsE "docker|containerd|lxc" /proc/1/cgroup 2>/dev/null
+}
+
+# Check if Asterisk process is running (works in both Docker and bare metal)
+asterisk_running() {
+    if is_docker; then
+        pgrep -x asterisk >/dev/null 2>&1
+    else
+        systemctl is-active asterisk >/dev/null 2>&1
+    fi
+}
+
+# Start/restart Asterisk (Docker-aware)
+restart_asterisk_safe() {
+    print_info "Restarting Asterisk..."
+    if is_docker; then
+        # In Docker: use Asterisk CLI to restart, or restart the process
+        if pgrep -x asterisk >/dev/null 2>&1; then
+            asterisk -rx "core restart now" 2>/dev/null || true
+            sleep 3
+        fi
+        # If not running, start it in the background
+        if ! pgrep -x asterisk >/dev/null 2>&1; then
+            rm -f /var/run/asterisk/asterisk.pid 2>/dev/null || true
+            asterisk -U asterisk -G asterisk &
+            sleep 3
+        fi
+        if pgrep -x asterisk >/dev/null 2>&1; then
+            print_success "Asterisk running"
+        else
+            print_error "Asterisk failed to start"
+        fi
+    else
+        systemctl stop asterisk 2>/dev/null || true
+        sleep 2
+        pkill -9 -x asterisk 2>/dev/null || true
+        rm -f /var/run/asterisk/asterisk.pid 2>/dev/null || true
+        rm -f /var/lib/asterisk/.asterisk_history 2>/dev/null || true
+        systemctl start asterisk
+        sleep 3
+        if systemctl is-active asterisk >/dev/null; then
+            print_success "Asterisk running"
+        else
+            print_error "Asterisk failed to start"
+            journalctl -u asterisk -n 15 --no-pager
+        fi
+    fi
+}
+
+# Web admin process management (Docker-aware)
+webadmin_running() {
+    pgrep -f "easy-asterisk-webadmin" >/dev/null 2>&1
+}
+
+start_webadmin() {
+    load_config
+    if webadmin_running; then
+        print_warn "Web admin already running"
+        return
+    fi
+    create_web_admin_script
+    if [[ ! -f "$WEB_ADMIN_HTPASSWD" ]] && [[ "${WEB_ADMIN_AUTH_DISABLED:-}" != "true" ]]; then
+        setup_web_admin_auth
+    fi
+    WEBADMIN_PORT="${WEB_ADMIN_PORT:-8080}" \
+    WEBADMIN_AUTH_DISABLED="${WEB_ADMIN_AUTH_DISABLED:-false}" \
+    nohup python3 "$WEB_ADMIN_SCRIPT" >/dev/null 2>&1 &
+    sleep 2
+    if webadmin_running; then
+        print_success "Web Admin started on port ${WEB_ADMIN_PORT}"
+    else
+        print_error "Web Admin failed to start"
+    fi
+}
+
+stop_webadmin() {
+    if webadmin_running; then
+        pkill -f "easy-asterisk-webadmin" 2>/dev/null || true
+        sleep 1
+        # Force kill if still running
+        if webadmin_running; then
+            pkill -9 -f "easy-asterisk-webadmin" 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+    # Also kill anything on the port
+    local port_pids=$(lsof -ti ":${WEB_ADMIN_PORT}" 2>/dev/null)
+    if [[ -n "$port_pids" ]]; then
+        echo "$port_pids" | xargs kill -9 2>/dev/null || true
+        sleep 1
+    fi
+    if ! webadmin_running; then
+        print_success "Web Admin stopped"
+    else
+        print_error "Web Admin could not be stopped"
+    fi
+}
+
+restart_webadmin() {
+    stop_webadmin 2>/dev/null
+    start_webadmin
+}
+
 generate_password() {
     tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16
 }
@@ -229,6 +336,12 @@ EOF
 }
 
 open_firewall_ports() {
+    if is_docker; then
+        # In Docker, firewall is managed on the host, not inside the container
+        # With network_mode: host, all ports are directly accessible
+        print_info "Docker mode: firewall is managed on the host"
+        return
+    fi
     print_info "Configuring firewall ports..."
     if command -v ufw &>/dev/null; then
         if ufw status 2>/dev/null | grep -q "Status: active"; then
@@ -1291,8 +1404,8 @@ detect_ptt_button() {
     echo "  - Log out and log back in, or reboot"
     echo "═══════════════════════════════════════════════════════"
 
-    # Restart PTT service if client is installed
-    if [[ "$INSTALLED_CLIENT" == "y" && -n "$KIOSK_USER" ]]; then
+    # Restart PTT service if client is installed (bare metal only)
+    if [[ "$INSTALLED_CLIENT" == "y" && -n "$KIOSK_USER" ]] && ! is_docker; then
         local user_dbus="XDG_RUNTIME_DIR=/run/user/${KIOSK_UID}"
         echo ""
         print_info "Restarting PTT service..."
@@ -1496,7 +1609,7 @@ show_preflight_check() {
 
 test_sip_connectivity() {
     print_header "SIP Connectivity Test"
-    if systemctl is-active asterisk >/dev/null; then
+    if asterisk_running; then
         print_success "Asterisk Running"
     else
         print_error "Asterisk Down"
@@ -2334,6 +2447,21 @@ provisioning_manager_menu() {
 # ================================================================
 
 manual_update_asterisk() {
+    if is_docker; then
+        print_header "Update Asterisk (Docker)"
+        echo "  In Docker, Asterisk is updated by rebuilding the container image."
+        echo ""
+        echo "  Steps:"
+        echo "    1. docker compose down"
+        echo "    2. docker compose build --no-cache"
+        echo "    3. docker compose up -d"
+        echo ""
+        echo "  Your configuration is preserved in Docker volumes."
+        echo "  Current version:"
+        asterisk -V 2>/dev/null || echo "  Asterisk not running"
+        return
+    fi
+
     print_header "Manual Asterisk Update"
     echo "WARNING: This will update Asterisk from the repository."
     echo "A backup will be created automatically."
@@ -2365,12 +2493,9 @@ manual_update_asterisk() {
 
     # Restart
     echo ""
-    print_info "Restarting Asterisk..."
-    systemctl restart asterisk
+    restart_asterisk_safe
 
-    sleep 3
-
-    if systemctl is-active asterisk >/dev/null; then
+    if asterisk_running; then
         print_success "Asterisk updated successfully"
         asterisk -V
         echo ""
@@ -2385,7 +2510,7 @@ manual_update_asterisk() {
         echo ""
         echo "Rolling back..."
         cp -r "$backup_dir/asterisk/"* /etc/asterisk/
-        systemctl restart asterisk
+        restart_asterisk_safe
         print_info "Rollback complete"
     fi
 }
@@ -2464,7 +2589,7 @@ watch_live_logs() {
 
 router_doctor() {
     print_header "Router Traffic Doctor"
-    if ! systemctl is-active asterisk >/dev/null; then
+    if ! asterisk_running; then
         print_error "Asterisk is NOT RUNNING"
         restart_asterisk_safe
         return
@@ -2493,6 +2618,10 @@ router_doctor() {
 }
 
 configure_local_client() {
+    if is_docker; then
+        print_error "Local client not available in Docker. Use Sipnetic, Linphone, or Baresip on your phone/tablet."
+        return
+    fi
     print_header "Configure Local Client"
     load_config
 
@@ -2626,6 +2755,10 @@ EOF
 }
 
 run_client_diagnostics() {
+    if is_docker; then
+        print_error "Client diagnostics not available in Docker. Run vpn-diagnostics for server-side checks."
+        return
+    fi
     print_header "Client Diagnostics"
     load_config
     local t_user="${KIOSK_USER:-$SUDO_USER}"
@@ -2750,6 +2883,10 @@ verify_audio_setup() {
 # ================================================================
 
 fix_asterisk_systemd() {
+    if is_docker; then
+        # No systemd in Docker - Asterisk runs as the main container process
+        return
+    fi
     print_info "Configuring systemd..."
     mkdir -p /etc/systemd/system/asterisk.service.d/
     cat > /etc/systemd/system/asterisk.service.d/override.conf << 'SVCEOF'
@@ -3102,25 +3239,8 @@ configure_asterisk() {
     rebuild_dialplan "quiet"
     
     restart_asterisk_safe
-    systemctl enable asterisk
-}
-
-restart_asterisk_safe() {
-    print_info "Restarting Asterisk..."
-    systemctl stop asterisk 2>/dev/null || true
-    sleep 2
-    # Use -x for exact match to avoid killing this script
-    pkill -9 -x asterisk 2>/dev/null || true
-    rm -f /var/run/asterisk/asterisk.pid 2>/dev/null || true
-    rm -f /var/lib/asterisk/.asterisk_history 2>/dev/null || true
-    systemctl start asterisk
-    sleep 3
-    
-    if systemctl is-active asterisk >/dev/null; then
-        print_success "Asterisk running"
-    else
-        print_error "Asterisk failed to start"
-        journalctl -u asterisk -n 15 --no-pager
+    if ! is_docker; then
+        systemctl enable asterisk
     fi
 }
 
@@ -3129,6 +3249,7 @@ restart_asterisk_safe() {
 # ================================================================
 
 configure_baresip() {
+    if is_docker; then return; fi
     local baresip_dir="/home/${KIOSK_USER}/.baresip"
     mkdir -p "$baresip_dir"
     
@@ -3240,6 +3361,10 @@ LAUNCHER
 }
 
 enable_client_services() {
+    if is_docker; then
+        # No local audio client in Docker containers
+        return
+    fi
     local systemd_dir="/home/${KIOSK_USER}/.config/systemd/user"
     mkdir -p "$systemd_dir"
 
@@ -3542,12 +3667,24 @@ setup_internet_access() {
 # ================================================================
 
 install_full() {
+    if is_docker; then
+        # In Docker: server is pre-installed, just configure
+        print_header "Server Configuration"
+        install_asterisk_packages
+        configure_asterisk
+        INSTALLED_SERVER="y"
+        ENABLE_TLS="n"
+        save_config
+        print_success "Server configured"
+        return
+    fi
+
     print_header "Full Installation"
     local default_user="${SUDO_USER:-$USER}"
     read -p "Client User [$default_user]: " target_user
     KIOSK_USER="${target_user:-$default_user}"
     KIOSK_UID=$(id -u "$KIOSK_USER")
-    
+
     if ! collect_common_config; then return; fi
     collect_client_config
     install_dependencies
@@ -3575,6 +3712,11 @@ install_full() {
 }
 
 install_server_only() {
+    if is_docker; then
+        install_full
+        return
+    fi
+
     print_header "Server Installation"
     ASTERISK_HOST="127.0.0.1"
     ENABLE_TLS="n"  # LAN-only by default, set to "y" only if internet/certs setup is run
@@ -3667,10 +3809,18 @@ collect_client_config() {
 
 install_dependencies() {
     install_asterisk_packages
-    install_baresip_packages
+    if ! is_docker; then
+        install_baresip_packages
+    fi
 }
 
 install_asterisk_packages() {
+    if is_docker; then
+        # In Docker, packages are pre-installed via Dockerfile
+        print_info "Docker mode: packages pre-installed"
+        mkdir -p /var/lib/asterisk /var/log/asterisk /var/spool/asterisk /var/run/asterisk
+        return
+    fi
     echo "exit 101" > /usr/sbin/policy-rc.d
     chmod +x /usr/sbin/policy-rc.d
     apt update
@@ -3684,11 +3834,45 @@ install_asterisk_packages() {
 }
 
 install_baresip_packages() {
+    if is_docker; then
+        # Baresip (local SIP client) is not used inside the container
+        print_info "Docker mode: Baresip not applicable (use mobile/desktop SIP clients)"
+        return
+    fi
     apt update
     apt install -y baresip baresip-core pipewire pipewire-alsa pipewire-pulse wireplumber alsa-utils evtest || true
 }
 
 uninstall_menu() {
+    if is_docker; then
+        print_header "Reset Configuration"
+        echo "  In Docker, the container is ephemeral."
+        echo "  To fully uninstall: docker compose down -v"
+        echo ""
+        echo "  1) Reset all configs (keep container)"
+        echo "  2) Reset devices only"
+        echo "  0) Cancel"
+        read -p "Select: " ch
+        case $ch in
+            1)
+                rm -rf /etc/easy-asterisk/*
+                print_success "Configuration reset. Restart container to regenerate defaults."
+                ;;
+            2)
+                if [[ -f /etc/asterisk/pjsip.conf ]]; then
+                    # Remove device sections, keep transport config
+                    local temp="/tmp/pjsip_base_$$.conf"
+                    awk '/^; === Device:/{exit} {print}' /etc/asterisk/pjsip.conf > "$temp"
+                    mv "$temp" /etc/asterisk/pjsip.conf
+                    chown asterisk:asterisk /etc/asterisk/pjsip.conf
+                    asterisk -rx "pjsip reload" >/dev/null 2>&1 || true
+                fi
+                print_success "All devices removed"
+                ;;
+        esac
+        return
+    fi
+
     print_header "Uninstall"
     echo "  1) Remove Everything"
     echo "  2) Asterisk Only"
@@ -3735,29 +3919,61 @@ show_main_menu() {
     print_header "Easy Asterisk v${SCRIPT_VERSION}"
 
     load_config
-    echo "  Status:"
-    if [[ -f "$CONFIG_FILE" ]]; then
-        [[ "$INSTALLED_SERVER" == "y" ]] && echo -e "    Server: ${GREEN}Installed${NC}" || echo -e "    Server: ${YELLOW}Not installed${NC}"
-        [[ "$INSTALLED_CLIENT" == "y" ]] && echo -e "    Client: ${GREEN}Installed${NC}" || echo -e "    Client: ${YELLOW}Not installed${NC}"
+
+    if is_docker; then
+        # Docker status display
+        echo "  Status:"
+        echo -e "    Mode: ${CYAN}Docker Container${NC}"
+        if asterisk_running; then
+            echo -e "    Asterisk: ${GREEN}Running${NC}"
+        else
+            echo -e "    Asterisk: ${RED}Not running${NC}"
+        fi
+        if webadmin_running; then
+            echo -e "    Web Admin: ${GREEN}Running${NC} (port ${WEB_ADMIN_PORT})"
+        else
+            echo -e "    Web Admin: ${YELLOW}Stopped${NC}"
+        fi
         [[ -n "$DOMAIN_NAME" ]] && echo -e "    Domain: ${DOMAIN_NAME}"
-    else
-        echo -e "    ${YELLOW}Not configured${NC}"
-    fi
-    echo ""
-    
-    declare -A menu_map
-    local count=1
-    
-    echo "  ${count}) Install/Configure"; menu_map[$count]="submenu_install"; ((count++))
-    if [[ "$INSTALLED_SERVER" == "y" ]]; then
+        [[ "$VPN_ICE_ENABLED" == "y" ]] && echo -e "    VPN ICE: ${GREEN}Enabled${NC} (${CUSTOM_STUN_SERVER:-auto})"
+        echo ""
+
+        declare -A menu_map
+        local count=1
+
+        if [[ "$INSTALLED_SERVER" != "y" ]]; then
+            echo "  ${count}) Configure Server"; menu_map[$count]="submenu_install"; ((count++))
+        fi
         echo "  ${count}) Server Settings"; menu_map[$count]="submenu_server"; ((count++))
         echo "  ${count}) Device Management"; menu_map[$count]="submenu_devices"; ((count++))
+        echo "  ${count}) Tools"; menu_map[$count]="submenu_tools"; ((count++))
+        echo "  0) Exit"
+    else
+        # Bare metal status display
+        echo "  Status:"
+        if [[ -f "$CONFIG_FILE" ]]; then
+            [[ "$INSTALLED_SERVER" == "y" ]] && echo -e "    Server: ${GREEN}Installed${NC}" || echo -e "    Server: ${YELLOW}Not installed${NC}"
+            [[ "$INSTALLED_CLIENT" == "y" ]] && echo -e "    Client: ${GREEN}Installed${NC}" || echo -e "    Client: ${YELLOW}Not installed${NC}"
+            [[ -n "$DOMAIN_NAME" ]] && echo -e "    Domain: ${DOMAIN_NAME}"
+        else
+            echo -e "    ${YELLOW}Not configured${NC}"
+        fi
+        echo ""
+
+        declare -A menu_map
+        local count=1
+
+        echo "  ${count}) Install/Configure"; menu_map[$count]="submenu_install"; ((count++))
+        if [[ "$INSTALLED_SERVER" == "y" ]]; then
+            echo "  ${count}) Server Settings"; menu_map[$count]="submenu_server"; ((count++))
+            echo "  ${count}) Device Management"; menu_map[$count]="submenu_devices"; ((count++))
+        fi
+        echo "  ${count}) Client Settings"; menu_map[$count]="submenu_client"; ((count++))
+        echo "  ${count}) Tools"; menu_map[$count]="submenu_tools"; ((count++))
+        echo "  0) Exit"
     fi
-    echo "  ${count}) Client Settings"; menu_map[$count]="submenu_client"; ((count++))
-    echo "  ${count}) Tools"; menu_map[$count]="submenu_tools"; ((count++))
-    echo "  0) Exit"
     echo ""
-    
+
     read -p "  Select: " choice
     [[ "$choice" == "0" ]] && exit 0
     local action=${menu_map[$choice]}
@@ -3766,6 +3982,20 @@ show_main_menu() {
 }
 
 submenu_install() {
+    if is_docker; then
+        clear
+        print_header "Configure Server"
+        echo "  1) Configure/Reconfigure Server"
+        echo "  2) Reset Configuration"
+        echo "  0) Back"
+        read -p "  Select: " choice
+        case $choice in
+            1) install_full; read -p "Press Enter..." ;;
+            2) uninstall_menu; read -p "Press Enter..." ;;
+        esac
+        return
+    fi
+
     clear
     print_header "Install"
     echo "  1) Full (server + client)"
@@ -5709,6 +5939,11 @@ WEBADMIN
 }
 
 create_web_admin_service() {
+    if is_docker; then
+        # In Docker, web admin is managed as a background process, not a systemd service
+        print_success "Web admin service configured (Docker process mode)"
+        return
+    fi
     cat > "$WEB_ADMIN_SERVICE" << EOF
 [Unit]
 Description=Easy Asterisk Web Admin
@@ -5767,9 +6002,9 @@ web_admin_menu() {
 
     print_header "Web Admin Management"
 
-    # Check current status
+    # Check current status (Docker-aware)
     local status="stopped"
-    if systemctl is-active --quiet easy-asterisk-webadmin 2>/dev/null; then
+    if webadmin_running; then
         status="running"
     fi
 
@@ -5798,103 +6033,28 @@ web_admin_menu() {
     case $choice in
         1)
             # Stop any existing instance first
-            if systemctl is-active --quiet easy-asterisk-webadmin 2>/dev/null; then
-                print_info "Stopping existing instance..."
-                systemctl stop easy-asterisk-webadmin 2>/dev/null || true
-                sleep 1
-            fi
-            # Kill anything on our port
-            local port_pids=$(lsof -ti ":${WEB_ADMIN_PORT}" 2>/dev/null)
-            if [[ -n "$port_pids" ]]; then
-                echo "$port_pids" | xargs kill -9 2>/dev/null || true
-                sleep 1
-            fi
-
-            # Always regenerate script to ensure latest version
+            stop_webadmin 2>/dev/null
             print_info "Installing/updating web admin..."
-            create_web_admin_script
-            create_web_admin_service
-            if [[ ! -f "$WEB_ADMIN_HTPASSWD" ]] && [[ "${WEB_ADMIN_AUTH_DISABLED:-}" != "true" ]]; then
-                setup_web_admin_auth
-            fi
-            systemctl daemon-reload
-            systemctl enable easy-asterisk-webadmin
-            systemctl start easy-asterisk-webadmin
-            sleep 2
-            if systemctl is-active --quiet easy-asterisk-webadmin; then
-                print_success "Web Admin started"
+            start_webadmin
+            if webadmin_running; then
                 echo ""
                 echo "  Access at: http://${server_ip}:${WEB_ADMIN_PORT}/clients"
                 [[ -n "$DOMAIN_NAME" ]] && echo "  Or: http://${DOMAIN_NAME}:${WEB_ADMIN_PORT}/clients"
-            else
-                print_error "Failed to start. Check: journalctl -u easy-asterisk-webadmin"
             fi
             ;;
         2)
             print_info "Stopping web admin..."
-            echo ""
-
-            # Check what's on the port first
-            echo "  $ netstat -tlnp | grep ${WEB_ADMIN_PORT}"
-            netstat -tlnp 2>/dev/null | grep "${WEB_ADMIN_PORT}" || echo "    (nothing found)"
-            echo ""
-
-            # First stop attempt
-            echo "  $ systemctl stop easy-asterisk-webadmin"
-            systemctl stop easy-asterisk-webadmin 2>&1 || true
-            sleep 1
-
-            # Check port again
-            echo ""
-            echo "  $ netstat -tlnp | grep ${WEB_ADMIN_PORT}"
-            netstat -tlnp 2>/dev/null | grep "${WEB_ADMIN_PORT}" || echo "    (nothing found)"
-
-            # If still in use, stop again
-            if netstat -tlnp 2>/dev/null | grep -q ":${WEB_ADMIN_PORT}"; then
-                echo ""
-                echo "  Port still in use, running stop again..."
-                echo "  $ systemctl stop easy-asterisk-webadmin"
-                systemctl stop easy-asterisk-webadmin 2>&1 || true
-                sleep 1
-
-                echo ""
-                echo "  $ netstat -tlnp | grep ${WEB_ADMIN_PORT}"
-                netstat -tlnp 2>/dev/null | grep "${WEB_ADMIN_PORT}" || echo "    (nothing found)"
-            fi
-
-            # If STILL in use, kill processes
-            if netstat -tlnp 2>/dev/null | grep -q ":${WEB_ADMIN_PORT}"; then
-                echo ""
-                echo "  Still in use, killing processes..."
-                local pid=$(netstat -tlnp 2>/dev/null | grep ":${WEB_ADMIN_PORT}" | awk '{print $7}' | cut -d'/' -f1 | head -1)
-                if [[ -n "$pid" ]]; then
-                    echo "  $ kill -9 $pid"
-                    kill -9 "$pid" 2>&1 || true
-                    sleep 1
-                fi
-            fi
-
-            # Disable the service
-            systemctl disable easy-asterisk-webadmin 2>/dev/null || true
-
-            # Final verification
-            echo ""
-            echo "  Final check:"
-            echo "  $ netstat -tlnp | grep ${WEB_ADMIN_PORT}"
-            if netstat -tlnp 2>/dev/null | grep ":${WEB_ADMIN_PORT}"; then
-                print_error "Port ${WEB_ADMIN_PORT} still in use!"
-            else
-                echo "    (nothing found)"
-                print_success "Web Admin stopped"
+            stop_webadmin
+            if ! is_docker; then
+                systemctl disable easy-asterisk-webadmin 2>/dev/null || true
             fi
             ;;
         3)
-            systemctl restart easy-asterisk-webadmin
-            print_success "Web Admin restarted"
+            restart_webadmin
             ;;
         4)
             setup_web_admin_auth
-            systemctl restart easy-asterisk-webadmin 2>/dev/null
+            restart_webadmin
             ;;
         5)
             read -p "New port [${WEB_ADMIN_PORT}]: " new_port
@@ -5902,15 +6062,18 @@ web_admin_menu() {
             if [[ "$new_port" =~ ^[0-9]+$ ]] && [[ "$new_port" -ge 1024 ]] && [[ "$new_port" -le 65535 ]]; then
                 WEB_ADMIN_PORT="$new_port"
                 save_config
-                create_web_admin_service
-                systemctl restart easy-asterisk-webadmin 2>/dev/null
+                restart_webadmin
                 print_success "Port changed to $new_port"
             else
                 print_error "Invalid port (must be 1024-65535)"
             fi
             ;;
         6)
-            journalctl -u easy-asterisk-webadmin -n 50 --no-pager
+            if is_docker; then
+                echo "  In Docker, check logs with: docker logs easy-asterisk"
+            else
+                journalctl -u easy-asterisk-webadmin -n 50 --no-pager
+            fi
             ;;
         7)
             print_header "Reverse Proxy Setup (Caddy)"
@@ -5931,7 +6094,7 @@ web_admin_menu() {
                     WEB_ADMIN_AUTH_DISABLED="true"
                     save_config
                     create_web_admin_script
-                    systemctl restart easy-asterisk-webadmin 2>/dev/null || true
+                    restart_webadmin
                     print_success "Internal auth disabled. Use Caddy basic_auth for security."
                     ;;
                 2)
@@ -5941,7 +6104,7 @@ web_admin_menu() {
                     if [[ ! -f "$WEB_ADMIN_HTPASSWD" ]]; then
                         setup_web_admin_auth
                     fi
-                    systemctl restart easy-asterisk-webadmin 2>/dev/null || true
+                    restart_webadmin
                     print_success "Internal auth enabled"
                     ;;
                 3)
@@ -6540,6 +6703,10 @@ submenu_client() {
 }
 
 fix_audio_manually() {
+    if is_docker; then
+        print_error "Audio management not available in Docker (no local audio hardware)"
+        return
+    fi
     print_header "Manual Audio Fix"
     load_config
     local t_user="${KIOSK_USER:-$SUDO_USER}"
@@ -6580,21 +6747,50 @@ fix_audio_manually() {
 submenu_tools() {
     clear
     print_header "Tools"
-    echo "  1) Audio Test"
-    echo "  2) Verify Audio/Codec Setup"
-    echo "  3) Fix Audio (Unmute & Restart)"
-    echo "  4) Room Directory"
-    echo "  5) Manual Update Asterisk"
-    echo "  0) Back"
-    read -p "  Select: " choice
-    case $choice in
-        1) run_audio_test ;;
-        2) verify_audio_setup ;;
-        3) fix_audio_manually ;;
-        4) show_room_directory ;;
-        5) manual_update_asterisk ;;
-        0) return ;;
-    esac
+
+    if is_docker; then
+        echo "  1) Room Directory"
+        echo "  2) Update Asterisk (Docker)"
+        echo "  3) VPN Diagnostics"
+        echo "  4) DNS Whitelist Check"
+        echo "  0) Back"
+        read -p "  Select: " choice
+        case $choice in
+            1) show_room_directory ;;
+            2) manual_update_asterisk ;;
+            3)
+                if [[ -f /usr/local/bin/vpn-diagnostics ]]; then
+                    bash /usr/local/bin/vpn-diagnostics
+                else
+                    print_error "vpn-diagnostics not found"
+                fi
+                ;;
+            4)
+                if [[ -f /usr/local/bin/dns-whitelist ]]; then
+                    bash /usr/local/bin/dns-whitelist --check
+                else
+                    print_error "dns-whitelist not found"
+                fi
+                ;;
+            0) return ;;
+        esac
+    else
+        echo "  1) Audio Test"
+        echo "  2) Verify Audio/Codec Setup"
+        echo "  3) Fix Audio (Unmute & Restart)"
+        echo "  4) Room Directory"
+        echo "  5) Manual Update Asterisk"
+        echo "  0) Back"
+        read -p "  Select: " choice
+        case $choice in
+            1) run_audio_test ;;
+            2) verify_audio_setup ;;
+            3) fix_audio_manually ;;
+            4) show_room_directory ;;
+            5) manual_update_asterisk ;;
+            0) return ;;
+        esac
+    fi
     [[ "$choice" != "0" ]] && read -p "Press Enter..."
     [[ "$choice" != "0" ]] && submenu_tools
 }
