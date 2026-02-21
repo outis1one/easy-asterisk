@@ -1,0 +1,110 @@
+# ================================================================
+# Easy Asterisk - Docker Compose
+#
+# Usage:
+#   docker compose up -d                      # Asterisk only
+#   docker compose --profile stun up -d       # Asterisk + self-hosted STUN
+#   docker exec -it easy-asterisk easy-asterisk   # Interactive management
+#   docker exec -it easy-asterisk vpn-diagnostics # VPN diagnostics
+#   docker exec -it easy-asterisk dns-whitelist   # DNS whitelist check
+#
+# For third-party VPNs with DNS filtering:
+#   Use --profile stun to run a self-hosted STUN server
+#   This eliminates all external DNS dependencies
+# ================================================================
+
+services:
+
+  # ── Asterisk PBX ───────────────────────────────────────────
+  asterisk:
+    build: .
+    container_name: easy-asterisk
+    # Host networking required for:
+    #   - RTP media ports (10000-20000 UDP) - too many to map individually
+    #   - VPN interface access (tun/tap/wg devices)
+    #   - Proper NAT detection and SIP Contact headers
+    network_mode: host
+    volumes:
+      - asterisk-config:/etc/asterisk
+      - easy-asterisk-config:/etc/easy-asterisk
+      - asterisk-logs:/var/log/asterisk
+      - asterisk-spool:/var/spool/asterisk
+      - asterisk-lib:/var/lib/asterisk
+    environment:
+      # ── Network Mode ──
+      # Leave DOMAIN_NAME empty for LAN/VPN mode (recommended)
+      - DOMAIN_NAME=${DOMAIN_NAME:-}
+      - ENABLE_TLS=${ENABLE_TLS:-n}
+      - LOCAL_CIDR=${LOCAL_CIDR:-}
+
+      # ── VPN Configuration ──
+      # Add your VPN subnet(s) here, space-separated
+      # Example: 10.8.0.0/24 or 100.64.0.0/10 (Tailscale)
+      - HAS_VLANS=${HAS_VLANS:-n}
+      - VLAN_SUBNETS=${VLAN_SUBNETS:-}
+
+      # ── STUN Server ──
+      # For self-hosted coturn: use your server's VPN/LAN IP + port 3478
+      # Example: STUN_SERVER=10.8.0.1:3478
+      # Leave empty to disable STUN (fine if VPN provides direct routing)
+      - STUN_SERVER=${STUN_SERVER:-}
+      - VPN_ICE_ENABLED=${VPN_ICE_ENABLED:-n}
+      - CUSTOM_STUN_SERVER=${CUSTOM_STUN_SERVER:-}
+
+      # ── RTP Port Range ──
+      # Reduce range for constrained environments
+      - RTP_START=${RTP_START:-10000}
+      - RTP_END=${RTP_END:-20000}
+
+      # ── Web Admin ──
+      - WEB_ADMIN_PORT=${WEB_ADMIN_PORT:-8080}
+      - WEB_ADMIN_AUTH_DISABLED=${WEB_ADMIN_AUTH_DISABLED:-false}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "asterisk", "-rx", "core show version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Self-Hosted STUN Server (coturn) ───────────────────────
+  # Activate with: docker compose --profile stun up -d
+  #
+  # Why self-hosted STUN?
+  #   - No external DNS dependencies (critical for DNS-filtered networks)
+  #   - STUN reached by IP address, not hostname
+  #   - Faster response than public STUN servers
+  #   - Works entirely within your VPN network
+  #
+  # After starting, set STUN_SERVER to your server's IP:3478
+  # in the .env file and restart the asterisk container.
+  coturn:
+    image: coturn/coturn:latest
+    container_name: easy-asterisk-stun
+    network_mode: host
+    command: >
+      -n
+      --no-auth
+      --no-tls
+      --no-dtls
+      --stun-only
+      --listening-port=3478
+      --fingerprint
+      --no-cli
+      --no-multicast-peers
+      --no-loopback-peers
+      --log-file=stdout
+    restart: unless-stopped
+    profiles:
+      - stun
+    healthcheck:
+      test: ["CMD-SHELL", "ss -uln | grep -q ':3478'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  asterisk-config:
+  easy-asterisk-config:
+  asterisk-logs:
+  asterisk-spool:
+  asterisk-lib:

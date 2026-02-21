@@ -20,6 +20,13 @@
 #   - HTTP Basic authentication with SHA256 password hashing
 #   - Access at http://server:8080/clients
 # - ADDED: VPN subnet auto-detection (Tailscale, WireGuard, OpenVPN)
+# - ADDED: VPN STUN/ICE configuration for third-party VPNs
+#   - Self-hosted coturn STUN (no external DNS dependencies)
+#   - Custom STUN server support
+#   - Per-device ICE for LAN/VPN mode endpoints
+# - ADDED: Docker container support (Dockerfile + docker-compose)
+# - ADDED: VPN diagnostics tool (vpn-diagnostics)
+# - ADDED: DNS whitelist checker for filtered networks (dns-whitelist)
 # - IMPROVED: Device deletion uses awk for reliable multi-section removal
 # - IMPROVED: Device renaming uses awk to handle all edge cases
 #
@@ -167,6 +174,8 @@ load_config() {
     VLAN_SUBNETS="${VLAN_SUBNETS:-}"
     WEB_ADMIN_PORT="${WEB_ADMIN_PORT:-8080}"
     WEB_ADMIN_AUTH_DISABLED="${WEB_ADMIN_AUTH_DISABLED:-false}"
+    VPN_ICE_ENABLED="${VPN_ICE_ENABLED:-n}"
+    CUSTOM_STUN_SERVER="${CUSTOM_STUN_SERVER:-}"
     return 0
 }
 
@@ -204,6 +213,8 @@ PTT_KEYCODE="$PTT_KEYCODE"
 LOCAL_CIDR="$LOCAL_CIDR"
 WEB_ADMIN_PORT="$WEB_ADMIN_PORT"
 WEB_ADMIN_AUTH_DISABLED="$WEB_ADMIN_AUTH_DISABLED"
+VPN_ICE_ENABLED="$VPN_ICE_ENABLED"
+CUSTOM_STUN_SERVER="$CUSTOM_STUN_SERVER"
 EOF
     chmod 644 "$CONFIG_FILE"
 
@@ -635,6 +646,10 @@ add_device_menu() {
         display_port="5060"
         display_transport="UDP"
         display_encryption="None"
+        # Enable ICE for VPN devices if VPN ICE mode is active
+        if [[ "$VPN_ICE_ENABLED" == "y" ]]; then
+            ice_block="ice_support=yes"
+        fi
     elif [[ "$conn_choice" == "2" ]]; then
         if [[ "$ENABLE_TLS" != "y" || -z "$DOMAIN_NAME" ]]; then
             print_error "FQDN access not configured. Run 'Setup Internet Access' first."
@@ -2837,12 +2852,20 @@ transport=config,pjsip.conf,criteria=type=transport
 EOF
     fi
 
-    # ICE and STUN only for FQDN/internet calling
+    # ICE and STUN configuration
+    # Enabled for: FQDN/internet mode OR VPN with ICE enabled
     load_config
     local ice_stun_config=""
     if [[ -n "$DOMAIN_NAME" ]]; then
+        # FQDN mode: always enable ICE
+        local stun_addr="${CUSTOM_STUN_SERVER:-stun.l.google.com:19302}"
         ice_stun_config="icesupport=yes
-stunaddr=stun.l.google.com:19302"
+stunaddr=${stun_addr}"
+    elif [[ "$VPN_ICE_ENABLED" == "y" ]]; then
+        # VPN mode with ICE: use custom or self-hosted STUN
+        local stun_addr="${CUSTOM_STUN_SERVER:-stun.l.google.com:19302}"
+        ice_stun_config="icesupport=yes
+stunaddr=${stun_addr}"
     else
         ice_stun_config="# icesupport disabled - LAN only mode"
     fi
@@ -4363,6 +4386,14 @@ def add_device(name, category, extension, conn_type='lan', auto_answer=None):
     password = generate_password()
 
     # Determine transport and encryption
+    # Check if VPN ICE mode is enabled (for third-party VPNs)
+    vpn_ice = 'n'
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r') as cf:
+            for cline in cf:
+                if cline.startswith('VPN_ICE_ENABLED='):
+                    vpn_ice = cline.strip().split('=', 1)[1].strip('"')
+
     if conn_type == 'fqdn':
         transport = 'transport=transport-tls'
         encryption = 'media_encryption=sdes'
@@ -4370,7 +4401,7 @@ def add_device(name, category, extension, conn_type='lan', auto_answer=None):
     else:
         transport = 'transport=transport-udp'
         encryption = 'media_encryption=no'
-        ice = ''
+        ice = 'ice_support=yes' if vpn_ice == 'y' else ''
 
     aa_tag = ''
     if auto_answer == 'yes':
@@ -5939,6 +5970,206 @@ web_admin_menu() {
     esac
 }
 
+configure_vpn_stun_ice() {
+    load_config
+    clear
+    print_header "VPN STUN/ICE Configuration"
+
+    echo "  This configures ICE (Interactive Connectivity Establishment) and"
+    echo "  STUN (Session Traversal Utilities for NAT) for third-party VPNs."
+    echo ""
+    echo "  ─────────────────────────────────────────────────────────────"
+    echo "  When do you need this?"
+    echo ""
+    echo "  • Your VPN does NAT between endpoints (audio fails or is one-way)"
+    echo "  • Caller and receiver are on different VPN segments"
+    echo "  • Direct VPN routing doesn't work for UDP/RTP traffic"
+    echo ""
+    echo "  When do you NOT need this?"
+    echo ""
+    echo "  • VPN gives both sides IPs on the same subnet (direct routing)"
+    echo "  • Audio works fine without STUN"
+    echo "  ─────────────────────────────────────────────────────────────"
+    echo ""
+
+    local current_stun="${CUSTOM_STUN_SERVER:-Not configured}"
+    local current_ice="${VPN_ICE_ENABLED:-n}"
+    echo -e "  Current Status:"
+    echo -e "    VPN ICE: $([[ "$current_ice" == "y" ]] && echo "${GREEN}Enabled${NC}" || echo "${YELLOW}Disabled${NC}")"
+    echo -e "    STUN Server: ${CYAN}${current_stun}${NC}"
+    echo ""
+
+    echo "  1) Enable VPN ICE + self-hosted STUN (recommended for DNS filtering)"
+    echo "  2) Enable VPN ICE + Google STUN (requires DNS access)"
+    echo "  3) Enable VPN ICE + custom STUN server"
+    echo "  4) Disable VPN ICE (standard LAN mode)"
+    echo "  5) Test current STUN server"
+    echo "  6) Run VPN diagnostics"
+    echo "  7) Check DNS whitelist"
+    echo "  0) Back"
+    echo ""
+    read -p "  Select: " stun_choice
+
+    case $stun_choice in
+        1)
+            # Self-hosted STUN via coturn
+            local server_ip=$(hostname -I | awk '{print $1}')
+            echo ""
+            echo "  Self-hosted STUN uses coturn on this server (port 3478)."
+            echo "  No external DNS dependencies - everything by IP."
+            echo ""
+
+            # Detect VPN IPs for suggestion
+            local vpn_ip=""
+            while IFS= read -r line; do
+                local iface=$(echo "$line" | awk '{print $2}' | tr -d ':')
+                local ip_addr=$(echo "$line" | awk '{print $4}' | cut -d'/' -f1)
+                if [[ "$iface" =~ ^(tun|tap|wg|tailscale|utun|ppp|nordlynx) ]]; then
+                    vpn_ip="$ip_addr"
+                    break
+                fi
+            done < <(ip -o -f inet addr show scope global 2>/dev/null)
+
+            local suggested_ip="${vpn_ip:-$server_ip}"
+            read -p "  STUN server IP [${suggested_ip}]: " stun_ip
+            stun_ip="${stun_ip:-$suggested_ip}"
+
+            read -p "  STUN port [3478]: " stun_port
+            stun_port="${stun_port:-3478}"
+
+            VPN_ICE_ENABLED="y"
+            CUSTOM_STUN_SERVER="${stun_ip}:${stun_port}"
+            save_config
+            repair_core_configs
+            generate_pjsip_conf
+            asterisk -rx "core reload" >/dev/null 2>&1 || true
+
+            print_success "VPN ICE enabled with self-hosted STUN: ${CUSTOM_STUN_SERVER}"
+            echo ""
+            echo "  Make sure coturn is running on port ${stun_port}:"
+            echo "    Docker: docker compose --profile stun up -d"
+            echo "    Manual: apt install coturn && systemctl start coturn"
+            echo ""
+            echo "  Configure Sipnetic STUN server: ${CUSTOM_STUN_SERVER}"
+            ;;
+        2)
+            # Google STUN
+            echo ""
+            echo -e "  ${YELLOW}Requires DNS access to: stun.l.google.com${NC}"
+            echo "  Add this domain to your DNS whitelist on all networks"
+            echo "  (server, caller, and receiver)."
+            echo ""
+            read -p "  Continue? [y/N]: " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                VPN_ICE_ENABLED="y"
+                CUSTOM_STUN_SERVER="stun.l.google.com:19302"
+                save_config
+                repair_core_configs
+                generate_pjsip_conf
+                asterisk -rx "core reload" >/dev/null 2>&1 || true
+                print_success "VPN ICE enabled with Google STUN"
+                echo ""
+                echo "  DNS whitelist required: stun.l.google.com (UDP 19302)"
+            fi
+            ;;
+        3)
+            # Custom STUN
+            echo ""
+            read -p "  STUN server address (host:port): " custom_stun
+            if [[ -n "$custom_stun" ]]; then
+                VPN_ICE_ENABLED="y"
+                CUSTOM_STUN_SERVER="$custom_stun"
+                save_config
+                repair_core_configs
+                generate_pjsip_conf
+                asterisk -rx "core reload" >/dev/null 2>&1 || true
+                print_success "VPN ICE enabled with custom STUN: ${custom_stun}"
+            else
+                print_error "No STUN server specified"
+            fi
+            ;;
+        4)
+            # Disable
+            VPN_ICE_ENABLED="n"
+            CUSTOM_STUN_SERVER=""
+            save_config
+            repair_core_configs
+            generate_pjsip_conf
+            asterisk -rx "core reload" >/dev/null 2>&1 || true
+            print_success "VPN ICE disabled (standard LAN mode)"
+            ;;
+        5)
+            # Test STUN
+            echo ""
+            if [[ -n "$CUSTOM_STUN_SERVER" ]]; then
+                local stun_host=$(echo "$CUSTOM_STUN_SERVER" | cut -d: -f1)
+                local stun_port=$(echo "$CUSTOM_STUN_SERVER" | cut -d: -f2)
+                stun_port="${stun_port:-3478}"
+
+                echo "  Testing STUN server: ${CUSTOM_STUN_SERVER}"
+                echo ""
+
+                # DNS test
+                if [[ "$stun_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    print_success "STUN server is an IP address (no DNS needed)"
+                else
+                    if nslookup "$stun_host" >/dev/null 2>&1; then
+                        print_success "DNS resolves: ${stun_host}"
+                    else
+                        print_error "DNS BLOCKED: ${stun_host}"
+                        echo "  Add to DNS whitelist or use IP address instead"
+                    fi
+                fi
+
+                # Connectivity test
+                if ping -c 2 -W 3 "$stun_host" >/dev/null 2>&1; then
+                    print_success "STUN host reachable: ${stun_host}"
+                else
+                    print_warn "STUN host not pingable (may still work if ICMP blocked)"
+                fi
+
+                # Port test via Asterisk
+                if command -v asterisk &>/dev/null; then
+                    local rtp_check=$(asterisk -rx "rtp show settings" 2>/dev/null | grep -i "stun\|ice" || echo "")
+                    if [[ -n "$rtp_check" ]]; then
+                        echo ""
+                        echo "  Asterisk RTP settings:"
+                        echo "$rtp_check" | while IFS= read -r line; do
+                            echo "    $line"
+                        done
+                    fi
+                fi
+            else
+                print_warn "No STUN server configured"
+                echo "  Configure one using options 1-3 above"
+            fi
+            ;;
+        6)
+            # VPN diagnostics
+            if command -v vpn-diagnostics &>/dev/null; then
+                vpn-diagnostics
+            elif [[ -f /usr/local/bin/vpn-diagnostics ]]; then
+                bash /usr/local/bin/vpn-diagnostics
+            else
+                print_error "vpn-diagnostics not found"
+                echo "  Install: copy scripts/vpn-diagnostics.sh to /usr/local/bin/vpn-diagnostics"
+            fi
+            ;;
+        7)
+            # DNS whitelist
+            if command -v dns-whitelist &>/dev/null; then
+                dns-whitelist --check
+            elif [[ -f /usr/local/bin/dns-whitelist ]]; then
+                bash /usr/local/bin/dns-whitelist --check
+            else
+                print_error "dns-whitelist not found"
+                echo "  Install: copy scripts/dns-whitelist.sh to /usr/local/bin/dns-whitelist"
+            fi
+            ;;
+        0) return ;;
+    esac
+}
+
 submenu_server() {
     clear
     print_header "Server Settings"
@@ -5953,6 +6184,7 @@ submenu_server() {
     echo "  9) Configure VLAN/VPN Subnets"
     echo " 10) Provisioning Manager"
     echo " 11) Web Admin (Client Management)"
+    echo " 12) VPN STUN/ICE Configuration"
     echo "  0) Back"
     read -p "  Select: " choice
     case $choice in
@@ -5967,6 +6199,7 @@ submenu_server() {
         9) configure_vlan_subnets ;;
         10) provisioning_manager_menu ;;
         11) web_admin_menu ;;
+        12) configure_vpn_stun_ice ;;
         0) return ;;
     esac
     [[ "$choice" != "0" ]] && read -p "Press Enter..."
