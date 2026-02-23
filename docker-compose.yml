@@ -82,26 +82,36 @@ services:
     image: coturn/coturn:latest
     container_name: easy-asterisk-coturn
     network_mode: host
+    # Pass env vars into container, then use simple shell to build command
+    environment:
+      - TURN_USER=${TURN_USERNAME:-easyasterisk}
+      - TURN_PASS=${TURN_PASSWORD:-changeme}
+      - REALM=${DOMAIN_NAME:-localhost}
+      - MIN_PORT=${TURN_RELAY_MIN:-49152}
+      - MAX_PORT=${TURN_RELAY_MAX:-49252}
+      - EXT_IP=${PUBLIC_IP:-}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        # Build coturn arguments
-        ARGS="-n --listening-port=3478 --fingerprint --lt-cred-mech"
-        ARGS="$$ARGS --user=${TURN_USERNAME:-easyasterisk}:${TURN_PASSWORD:-changeme}"
-        ARGS="$$ARGS --realm=${DOMAIN_NAME:-localhost}"
-        ARGS="$$ARGS --min-port=${TURN_RELAY_MIN:-49152}"
-        ARGS="$$ARGS --max-port=${TURN_RELAY_MAX:-49252}"
-        # Only add external-ip if PUBLIC_IP is set
-        if [ -n "${PUBLIC_IP:-}" ]; then
-          ARGS="$$ARGS --external-ip=${PUBLIC_IP}"
+        EXTRA=""
+        if [ -n "$EXT_IP" ]; then
+          EXTRA="--external-ip=$EXT_IP"
         fi
-        ARGS="$$ARGS --no-tls --no-dtls --no-cli"
-        ARGS="$$ARGS --no-multicast-peers --no-loopback-peers"
-        ARGS="$$ARGS --log-file=stdout"
-        exec turnserver $$ARGS
+        exec turnserver -n \
+          --listening-port=3478 \
+          --fingerprint \
+          --lt-cred-mech \
+          --user=$TURN_USER:$TURN_PASS \
+          --realm=$REALM \
+          --min-port=$MIN_PORT \
+          --max-port=$MAX_PORT \
+          --no-tls --no-dtls --no-cli \
+          --no-multicast-peers \
+          --log-file=stdout \
+          $EXTRA
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "turnutils_stunclient", "127.0.0.1"]
+      test: ["CMD-SHELL", "turnutils_stunclient 127.0.0.1 >/dev/null 2>&1"]
       interval: 10s
       timeout: 5s
       retries: 3
