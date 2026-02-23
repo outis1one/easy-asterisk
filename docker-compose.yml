@@ -101,7 +101,7 @@ services:
         exec turnserver $$ARGS
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "ss -uln | grep -q ':3478'"]
+      test: ["CMD-SHELL", "netstat -uln | grep -q ':3478'"]
       interval: 30s
       timeout: 5s
       retries: 3
