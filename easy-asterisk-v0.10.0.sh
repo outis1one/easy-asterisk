@@ -11,12 +11,22 @@
 # - FIXED: Extension renaming now preserves AA tags correctly
 # - FIXED: LAN/VPN devices now explicitly use UDP transport (prevents TLS fallback)
 # - FIXED: LAN devices now have media_encryption=no to prevent SRTP issues
+# - FIXED: VPN subnets now included as local_net in LAN mode (fixes VPN mobile offline)
+# - FIXED: One-way audio on WiFi-to-mobile-data handoff (rtp_keepalive + timers)
 # - ADDED: Web Admin interface for browser-based client management
 #   - View device status (online/offline) in real-time
 #   - Add/delete devices via web interface
 #   - View rooms and categories
 #   - HTTP Basic authentication with SHA256 password hashing
 #   - Access at http://server:8080/clients
+# - ADDED: VPN subnet auto-detection (Tailscale, WireGuard, OpenVPN)
+# - ADDED: VPN STUN/ICE configuration for third-party VPNs
+#   - Self-hosted coturn STUN (no external DNS dependencies)
+#   - Custom STUN server support
+#   - Per-device ICE for LAN/VPN mode endpoints
+# - ADDED: Docker container support (Dockerfile + docker-compose)
+# - ADDED: VPN diagnostics tool (vpn-diagnostics)
+# - ADDED: DNS whitelist checker for filtered networks (dns-whitelist)
 # - IMPROVED: Device deletion uses awk for reliable multi-section removal
 # - IMPROVED: Device renaming uses awk to handle all edge cases
 #
@@ -72,6 +82,113 @@ check_root() {
         print_error "This script must be run as root (use sudo)"
         exit 1
     fi
+}
+
+# ── Docker / Container Detection ─────────────────────────────
+# Returns 0 (true) if running inside a Docker/container environment
+
+is_docker() {
+    [[ -f /.dockerenv ]] || grep -qsE "docker|containerd|lxc" /proc/1/cgroup 2>/dev/null
+}
+
+# Check if Asterisk process is running (works in both Docker and bare metal)
+asterisk_running() {
+    if is_docker; then
+        pgrep -x asterisk >/dev/null 2>&1
+    else
+        systemctl is-active asterisk >/dev/null 2>&1
+    fi
+}
+
+# Start/restart Asterisk (Docker-aware)
+restart_asterisk_safe() {
+    print_info "Restarting Asterisk..."
+    if is_docker; then
+        # In Docker: use Asterisk CLI to restart, or restart the process
+        if pgrep -x asterisk >/dev/null 2>&1; then
+            asterisk -rx "core restart now" 2>/dev/null || true
+            sleep 3
+        fi
+        # If not running, start it in the background
+        if ! pgrep -x asterisk >/dev/null 2>&1; then
+            rm -f /var/run/asterisk/asterisk.pid 2>/dev/null || true
+            asterisk -U asterisk -G asterisk &
+            sleep 3
+        fi
+        if pgrep -x asterisk >/dev/null 2>&1; then
+            print_success "Asterisk running"
+        else
+            print_error "Asterisk failed to start"
+        fi
+    else
+        systemctl stop asterisk 2>/dev/null || true
+        sleep 2
+        pkill -9 -x asterisk 2>/dev/null || true
+        rm -f /var/run/asterisk/asterisk.pid 2>/dev/null || true
+        rm -f /var/lib/asterisk/.asterisk_history 2>/dev/null || true
+        systemctl start asterisk
+        sleep 3
+        if systemctl is-active asterisk >/dev/null; then
+            print_success "Asterisk running"
+        else
+            print_error "Asterisk failed to start"
+            journalctl -u asterisk -n 15 --no-pager
+        fi
+    fi
+}
+
+# Web admin process management (Docker-aware)
+webadmin_running() {
+    pgrep -f "easy-asterisk-webadmin" >/dev/null 2>&1
+}
+
+start_webadmin() {
+    load_config
+    if webadmin_running; then
+        print_warn "Web admin already running"
+        return
+    fi
+    create_web_admin_script
+    if [[ ! -f "$WEB_ADMIN_HTPASSWD" ]] && [[ "${WEB_ADMIN_AUTH_DISABLED:-}" != "true" ]]; then
+        setup_web_admin_auth
+    fi
+    WEBADMIN_PORT="${WEB_ADMIN_PORT:-8080}" \
+    WEBADMIN_AUTH_DISABLED="${WEB_ADMIN_AUTH_DISABLED:-false}" \
+    nohup python3 "$WEB_ADMIN_SCRIPT" >/dev/null 2>&1 &
+    sleep 2
+    if webadmin_running; then
+        print_success "Web Admin started on port ${WEB_ADMIN_PORT}"
+    else
+        print_error "Web Admin failed to start"
+    fi
+}
+
+stop_webadmin() {
+    if webadmin_running; then
+        pkill -f "easy-asterisk-webadmin" 2>/dev/null || true
+        sleep 1
+        # Force kill if still running
+        if webadmin_running; then
+            pkill -9 -f "easy-asterisk-webadmin" 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+    # Also kill anything on the port
+    local port_pids=$(lsof -ti ":${WEB_ADMIN_PORT}" 2>/dev/null)
+    if [[ -n "$port_pids" ]]; then
+        echo "$port_pids" | xargs kill -9 2>/dev/null || true
+        sleep 1
+    fi
+    if ! webadmin_running; then
+        print_success "Web Admin stopped"
+    else
+        print_error "Web Admin could not be stopped"
+    fi
+}
+
+restart_webadmin() {
+    stop_webadmin 2>/dev/null
+    start_webadmin
 }
 
 generate_password() {
@@ -164,6 +281,12 @@ load_config() {
     VLAN_SUBNETS="${VLAN_SUBNETS:-}"
     WEB_ADMIN_PORT="${WEB_ADMIN_PORT:-8080}"
     WEB_ADMIN_AUTH_DISABLED="${WEB_ADMIN_AUTH_DISABLED:-false}"
+    VPN_ICE_ENABLED="${VPN_ICE_ENABLED:-n}"
+    CUSTOM_STUN_SERVER="${CUSTOM_STUN_SERVER:-}"
+    TURN_ENABLED="${TURN_ENABLED:-n}"
+    TURN_SERVER="${TURN_SERVER:-}"
+    TURN_USERNAME="${TURN_USERNAME:-}"
+    TURN_PASSWORD="${TURN_PASSWORD:-}"
     return 0
 }
 
@@ -201,6 +324,12 @@ PTT_KEYCODE="$PTT_KEYCODE"
 LOCAL_CIDR="$LOCAL_CIDR"
 WEB_ADMIN_PORT="$WEB_ADMIN_PORT"
 WEB_ADMIN_AUTH_DISABLED="$WEB_ADMIN_AUTH_DISABLED"
+VPN_ICE_ENABLED="$VPN_ICE_ENABLED"
+CUSTOM_STUN_SERVER="$CUSTOM_STUN_SERVER"
+TURN_ENABLED="$TURN_ENABLED"
+TURN_SERVER="$TURN_SERVER"
+TURN_USERNAME="$TURN_USERNAME"
+TURN_PASSWORD="$TURN_PASSWORD"
 EOF
     chmod 644 "$CONFIG_FILE"
 
@@ -215,6 +344,12 @@ EOF
 }
 
 open_firewall_ports() {
+    if is_docker; then
+        # In Docker, firewall is managed on the host, not inside the container
+        # With network_mode: host, all ports are directly accessible
+        print_info "Docker mode: firewall is managed on the host"
+        return
+    fi
     print_info "Configuring firewall ports..."
     if command -v ufw &>/dev/null; then
         if ufw status 2>/dev/null | grep -q "Status: active"; then
@@ -609,45 +744,91 @@ add_device_menu() {
     local display_transport="UDP"
     local display_encryption="None"
 
-    echo ""
-    echo "═══════════════════════════════════════════════════════════════"
-    echo -e "  HOW WILL THIS DEVICE CONNECT?"
-    echo "═══════════════════════════════════════════════════════════════"
-    echo ""
-    echo -e "  1) ${GREEN}LAN/VPN${NC} - Same network or VPN tunnel (UDP)"
-    if [[ "$ENABLE_TLS" == "y" && -n "$DOMAIN_NAME" ]]; then
-        echo -e "  2) ${CYAN}FQDN${NC} - Internet or cross-VLAN via ${DOMAIN_NAME} (TLS)"
-    else
-        echo -e "  2) ${YELLOW}FQDN${NC} - Not configured (run 'Setup Internet Access' first)"
-    fi
-    echo ""
-    read -p "  Select [1]: " conn_choice
-    conn_choice="${conn_choice:-1}"
+    # In Docker with FQDN: default to FQDN mode for all devices
+    if is_docker && [[ -n "$DOMAIN_NAME" ]]; then
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo -e "  HOW WILL THIS DEVICE CONNECT?"
+        echo "═══════════════════════════════════════════════════════════════"
+        echo ""
+        echo -e "  1) ${CYAN}FQDN (recommended)${NC} - Via ${DOMAIN_NAME} (TLS) - works from any network"
+        echo -e "  2) ${GREEN}LAN only${NC} - Same local network (UDP)"
+        echo ""
+        read -p "  Select [1]: " conn_choice
+        conn_choice="${conn_choice:-1}"
 
-    if [[ "$conn_choice" == "1" ]]; then
-        # LAN/VPN - UDP, no encryption (explicit transport prevents TLS fallback)
-        transport_block="transport=transport-udp"
-        encryption_block="media_encryption=no"
-        display_server="$(hostname -I | awk '{print $1}')"
-        display_port="5060"
-        display_transport="UDP"
-        display_encryption="None"
-    elif [[ "$conn_choice" == "2" ]]; then
-        if [[ "$ENABLE_TLS" != "y" || -z "$DOMAIN_NAME" ]]; then
-            print_error "FQDN access not configured. Run 'Setup Internet Access' first."
-            return
+        if [[ "$conn_choice" == "2" ]]; then
+            transport_block="transport=transport-udp"
+            encryption_block="media_encryption=no"
+            display_server="$(hostname -I | awk '{print $1}')"
+            display_port="5060"
+            display_transport="UDP"
+            display_encryption="None"
+            ice_block="ice_support=yes"
+        else
+            conn_type="fqdn"
+            transport_block="transport=transport-tls"
+            encryption_block="media_encryption=sdes"
+            ice_block="ice_support=yes"
+            display_server="$DOMAIN_NAME"
+            display_port="5061"
+            display_transport="TLS"
+            display_encryption="SRTP (SDES)"
         fi
-        conn_type="fqdn"
-        transport_block="transport=transport-tls"
-        encryption_block="media_encryption=sdes"
-        ice_block="ice_support=yes"
-        display_server="$DOMAIN_NAME"
-        display_port="5061"
-        display_transport="TLS"
-        display_encryption="SRTP (SDES)"
+    else
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo -e "  HOW WILL THIS DEVICE CONNECT?"
+        echo "═══════════════════════════════════════════════════════════════"
+        echo ""
+        echo -e "  1) ${GREEN}LAN/VPN${NC} - Same network or VPN tunnel (UDP)"
+        if [[ "$ENABLE_TLS" == "y" && -n "$DOMAIN_NAME" ]]; then
+            echo -e "  2) ${CYAN}FQDN${NC} - Internet or cross-VLAN via ${DOMAIN_NAME} (TLS)"
+        else
+            echo -e "  2) ${YELLOW}FQDN${NC} - Not configured (run 'Setup Internet Access' first)"
+        fi
+        echo ""
+        read -p "  Select [1]: " conn_choice
+        conn_choice="${conn_choice:-1}"
+
+        if [[ "$conn_choice" == "1" ]]; then
+            # LAN/VPN - UDP, no encryption (explicit transport prevents TLS fallback)
+            transport_block="transport=transport-udp"
+            encryption_block="media_encryption=no"
+            display_server="$(hostname -I | awk '{print $1}')"
+            display_port="5060"
+            display_transport="UDP"
+            display_encryption="None"
+            # Enable ICE for VPN devices if VPN ICE mode is active
+            if [[ "$VPN_ICE_ENABLED" == "y" ]]; then
+                ice_block="ice_support=yes"
+            fi
+        elif [[ "$conn_choice" == "2" ]]; then
+            if [[ "$ENABLE_TLS" != "y" || -z "$DOMAIN_NAME" ]]; then
+                print_error "FQDN access not configured. Run 'Setup Internet Access' first."
+                return
+            fi
+            conn_type="fqdn"
+            transport_block="transport=transport-tls"
+            encryption_block="media_encryption=sdes"
+            ice_block="ice_support=yes"
+            display_server="$DOMAIN_NAME"
+            display_port="5061"
+            display_transport="TLS"
+            display_encryption="SRTP (SDES)"
+        fi
     fi
 
     backup_config "/etc/asterisk/pjsip.conf"
+
+    # Mobile devices benefit from keepalive to maintain NAT mappings
+    # during WiFi/mobile data transitions
+    local keepalive_block=""
+    if [[ "$cat_id" == "mobile" ]]; then
+        keepalive_block="rtp_keepalive=15
+rtp_timeout=120
+rtp_timeout_hold=120"
+    fi
 
     cat >> /etc/asterisk/pjsip.conf << EOF
 
@@ -666,6 +847,7 @@ direct_media=no
 rtp_symmetric=yes
 force_rport=yes
 rewrite_contact=yes
+${keepalive_block}
 ${ice_block}
 auth=${ext}
 aors=${ext}
@@ -681,7 +863,7 @@ password=${pass}
 type=aor
 max_contacts=5
 remove_existing=yes
-qualify_frequency=60
+qualify_frequency=30
 EOF
 
     chown -R asterisk:asterisk /etc/asterisk 2>/dev/null || true
@@ -1263,8 +1445,8 @@ detect_ptt_button() {
     echo "  - Log out and log back in, or reboot"
     echo "═══════════════════════════════════════════════════════"
 
-    # Restart PTT service if client is installed
-    if [[ "$INSTALLED_CLIENT" == "y" && -n "$KIOSK_USER" ]]; then
+    # Restart PTT service if client is installed (bare metal only)
+    if [[ "$INSTALLED_CLIENT" == "y" && -n "$KIOSK_USER" ]] && ! is_docker; then
         local user_dbus="XDG_RUNTIME_DIR=/run/user/${KIOSK_UID}"
         echo ""
         print_info "Restarting PTT service..."
@@ -1468,7 +1650,7 @@ show_preflight_check() {
 
 test_sip_connectivity() {
     print_header "SIP Connectivity Test"
-    if systemctl is-active asterisk >/dev/null; then
+    if asterisk_running; then
         print_success "Asterisk Running"
     else
         print_error "Asterisk Down"
@@ -1494,35 +1676,81 @@ verify_cidr_config() {
 }
 
 configure_vlan_subnets() {
-    print_header "VLAN Configuration"
+    print_header "VLAN / VPN Subnet Configuration"
     load_config
 
-    echo "VLAN Support for Asterisk Easy"
+    echo "Additional Subnet Support for Easy Asterisk"
     echo "================================================"
     echo ""
-    echo "If your network uses VLANs (Virtual LANs), you need to"
-    echo "tell Asterisk about all the local subnets to prevent"
-    echo "calls from dropping after 30 seconds."
+    echo "If your network uses VLANs or VPNs, you need to tell"
+    echo "Asterisk about all the local subnets so that:"
+    echo "  - Calls don't drop after 30 seconds (VLAN issue)"
+    echo "  - VPN-connected mobile devices can register"
+    echo "  - Audio works correctly for VPN users"
     echo ""
     echo "Example subnets:"
     echo "  192.168.1.0/24    - Main network"
     echo "  192.168.10.0/24   - IoT VLAN"
-    echo "  192.168.20.0/24   - Guest VLAN"
-    echo "  10.0.0.0/8        - Large private network"
+    echo "  100.64.0.0/10     - Tailscale VPN"
+    echo "  10.0.0.0/8        - WireGuard/OpenVPN"
     echo ""
 
-    read -p "Does your network use VLANs? (y/n) [${HAS_VLANS}]: " has_vlans
+    # Auto-detect VPN interfaces and their subnets
+    local detected_vpn_subnets=""
+    local vpn_info=""
+    while IFS= read -r line; do
+        local iface=$(echo "$line" | awk '{print $2}' | tr -d ':')
+        local addr=$(echo "$line" | awk '{print $4}')
+        if [[ -n "$addr" && -n "$iface" ]]; then
+            case "$iface" in
+                tailscale*|ts*)
+                    vpn_info="${vpn_info}  Detected: ${iface} -> ${addr} (Tailscale)\n"
+                    detected_vpn_subnets="${detected_vpn_subnets} 100.64.0.0/10"
+                    ;;
+                wg*)
+                    vpn_info="${vpn_info}  Detected: ${iface} -> ${addr} (WireGuard)\n"
+                    detected_vpn_subnets="${detected_vpn_subnets} ${addr}"
+                    ;;
+                tun*|tap*)
+                    vpn_info="${vpn_info}  Detected: ${iface} -> ${addr} (OpenVPN/VPN tunnel)\n"
+                    detected_vpn_subnets="${detected_vpn_subnets} ${addr}"
+                    ;;
+                nordlynx*|proton*)
+                    vpn_info="${vpn_info}  Detected: ${iface} -> ${addr} (VPN)\n"
+                    detected_vpn_subnets="${detected_vpn_subnets} ${addr}"
+                    ;;
+            esac
+        fi
+    done < <(ip -o -f inet addr show 2>/dev/null | grep -vE 'lo |docker|br-|veth')
+    detected_vpn_subnets=$(echo "$detected_vpn_subnets" | xargs -n1 2>/dev/null | sort -u | xargs 2>/dev/null)
+
+    if [[ -n "$vpn_info" ]]; then
+        echo -e "${GREEN}VPN interfaces detected on this server:${NC}"
+        echo -e "$vpn_info"
+        echo "  Suggested VPN subnets: ${detected_vpn_subnets}"
+        echo ""
+        echo "  NOTE: If mobile devices connect via VPN (e.g., Tailscale on phones),"
+        echo "  you MUST add the VPN subnet here for them to reach Asterisk."
+        echo ""
+    fi
+
+    read -p "Does your network use VLANs or VPNs? (y/n) [${HAS_VLANS}]: " has_vlans
     has_vlans=${has_vlans:-$HAS_VLANS}
 
     if [[ "$has_vlans" =~ ^[Yy] ]]; then
         HAS_VLANS="y"
         echo ""
-        echo "Current VLAN Subnets: ${VLAN_SUBNETS:-none}"
+        echo "Current Subnets: ${VLAN_SUBNETS:-none}"
+        if [[ -n "$detected_vpn_subnets" ]]; then
+            echo "Detected VPN Subnets: ${detected_vpn_subnets}"
+        fi
         echo ""
-        echo "Enter VLAN subnets in CIDR notation, separated by spaces."
-        echo "Example: 192.168.1.0/24 192.168.10.0/24 192.168.20.0/24"
+        echo "Enter ALL additional subnets (VLAN + VPN) in CIDR notation, separated by spaces."
+        echo "Example: 192.168.10.0/24 100.64.0.0/10"
         echo ""
-        read -p "VLAN Subnets: " vlan_input
+        local default_subnets="${VLAN_SUBNETS:-$detected_vpn_subnets}"
+        read -p "Subnets [${default_subnets}]: " vlan_input
+        vlan_input="${vlan_input:-$default_subnets}"
 
         if [[ -n "$vlan_input" ]]; then
             VLAN_SUBNETS="$vlan_input"
@@ -2260,6 +2488,21 @@ provisioning_manager_menu() {
 # ================================================================
 
 manual_update_asterisk() {
+    if is_docker; then
+        print_header "Update Asterisk (Docker)"
+        echo "  In Docker, Asterisk is updated by rebuilding the container image."
+        echo ""
+        echo "  Steps:"
+        echo "    1. docker compose down"
+        echo "    2. docker compose build --no-cache"
+        echo "    3. docker compose up -d"
+        echo ""
+        echo "  Your configuration is preserved in Docker volumes."
+        echo "  Current version:"
+        asterisk -V 2>/dev/null || echo "  Asterisk not running"
+        return
+    fi
+
     print_header "Manual Asterisk Update"
     echo "WARNING: This will update Asterisk from the repository."
     echo "A backup will be created automatically."
@@ -2291,12 +2534,9 @@ manual_update_asterisk() {
 
     # Restart
     echo ""
-    print_info "Restarting Asterisk..."
-    systemctl restart asterisk
+    restart_asterisk_safe
 
-    sleep 3
-
-    if systemctl is-active asterisk >/dev/null; then
+    if asterisk_running; then
         print_success "Asterisk updated successfully"
         asterisk -V
         echo ""
@@ -2311,7 +2551,7 @@ manual_update_asterisk() {
         echo ""
         echo "Rolling back..."
         cp -r "$backup_dir/asterisk/"* /etc/asterisk/
-        systemctl restart asterisk
+        restart_asterisk_safe
         print_info "Rollback complete"
     fi
 }
@@ -2390,7 +2630,7 @@ watch_live_logs() {
 
 router_doctor() {
     print_header "Router Traffic Doctor"
-    if ! systemctl is-active asterisk >/dev/null; then
+    if ! asterisk_running; then
         print_error "Asterisk is NOT RUNNING"
         restart_asterisk_safe
         return
@@ -2419,6 +2659,10 @@ router_doctor() {
 }
 
 configure_local_client() {
+    if is_docker; then
+        print_error "Local client not available in Docker. Use Sipnetic, Linphone, or Baresip on your phone/tablet."
+        return
+    fi
     print_header "Configure Local Client"
     load_config
 
@@ -2552,6 +2796,10 @@ EOF
 }
 
 run_client_diagnostics() {
+    if is_docker; then
+        print_error "Client diagnostics not available in Docker. Run vpn-diagnostics for server-side checks."
+        return
+    fi
     print_header "Client Diagnostics"
     load_config
     local t_user="${KIOSK_USER:-$SUDO_USER}"
@@ -2676,6 +2924,10 @@ verify_audio_setup() {
 # ================================================================
 
 fix_asterisk_systemd() {
+    if is_docker; then
+        # No systemd in Docker - Asterisk runs as the main container process
+        return
+    fi
     print_info "Configuring systemd..."
     mkdir -p /etc/systemd/system/asterisk.service.d/
     cat > /etc/systemd/system/asterisk.service.d/override.conf << 'SVCEOF'
@@ -2778,22 +3030,31 @@ transport=config,pjsip.conf,criteria=type=transport
 EOF
     fi
 
-    # ICE and STUN only for FQDN/internet calling
+    # ICE / STUN / TURN configuration
+    # Enabled for: FQDN/internet mode OR VPN with ICE enabled
     load_config
-    local ice_stun_config=""
-    if [[ -n "$DOMAIN_NAME" ]]; then
-        ice_stun_config="icesupport=yes
-stunaddr=stun.l.google.com:19302"
+    local ice_config=""
+    if [[ -n "$DOMAIN_NAME" ]] || [[ "$VPN_ICE_ENABLED" == "y" ]] || [[ "$TURN_ENABLED" == "y" ]]; then
+        local stun_addr="${TURN_SERVER:-${CUSTOM_STUN_SERVER:-stun.l.google.com:19302}}"
+        ice_config="icesupport=yes
+stunaddr=${stun_addr}"
+        # Add TURN relay if configured (required for calls through strict NAT/VPN)
+        if [[ "$TURN_ENABLED" == "y" && -n "$TURN_SERVER" && -n "$TURN_USERNAME" && -n "$TURN_PASSWORD" ]]; then
+            ice_config="${ice_config}
+turnaddr=${TURN_SERVER}
+turnusername=${TURN_USERNAME}
+turnpassword=${TURN_PASSWORD}"
+        fi
     else
-        ice_stun_config="# icesupport disabled - LAN only mode"
+        ice_config="# icesupport disabled - LAN only mode"
     fi
 
     cat > /etc/asterisk/rtp.conf << EOF
 [general]
-rtpstart=10000
-rtpend=20000
+rtpstart=${RTP_START:-10000}
+rtpend=${RTP_END:-20000}
 strictrtp=yes
-${ice_stun_config}
+${ice_config}
 EOF
     
     cat > /etc/asterisk/logger.conf << EOF
@@ -2841,10 +3102,17 @@ local_net=${vlan_subnet}"
 
     local nat_settings=""
     if [[ -n "$public_ip" && -n "$DOMAIN_NAME" ]]; then
+        # FQDN mode: full NAT settings with external addresses
         nat_settings="external_media_address=$public_ip
 external_signaling_address=$public_ip
 ${all_local_nets}"
         print_info "NAT: Public IP=$public_ip, Server IP=$server_ip"
+    elif [[ "$HAS_VLANS" == "y" && -n "$VLAN_SUBNETS" ]]; then
+        # LAN/VPN mode with VLAN/VPN subnets: include local_net entries
+        # so Asterisk recognizes VPN traffic as local (prevents VPN devices
+        # appearing offline and fixes media routing for VPN-connected mobiles)
+        nat_settings="${all_local_nets}"
+        print_info "LAN mode with additional subnets: $VLAN_SUBNETS"
     fi
 
     cat > "$conf_file" << EOF
@@ -3013,25 +3281,8 @@ configure_asterisk() {
     rebuild_dialplan "quiet"
     
     restart_asterisk_safe
-    systemctl enable asterisk
-}
-
-restart_asterisk_safe() {
-    print_info "Restarting Asterisk..."
-    systemctl stop asterisk 2>/dev/null || true
-    sleep 2
-    # Use -x for exact match to avoid killing this script
-    pkill -9 -x asterisk 2>/dev/null || true
-    rm -f /var/run/asterisk/asterisk.pid 2>/dev/null || true
-    rm -f /var/lib/asterisk/.asterisk_history 2>/dev/null || true
-    systemctl start asterisk
-    sleep 3
-    
-    if systemctl is-active asterisk >/dev/null; then
-        print_success "Asterisk running"
-    else
-        print_error "Asterisk failed to start"
-        journalctl -u asterisk -n 15 --no-pager
+    if ! is_docker; then
+        systemctl enable asterisk
     fi
 }
 
@@ -3040,6 +3291,7 @@ restart_asterisk_safe() {
 # ================================================================
 
 configure_baresip() {
+    if is_docker; then return; fi
     local baresip_dir="/home/${KIOSK_USER}/.baresip"
     mkdir -p "$baresip_dir"
     
@@ -3151,6 +3403,10 @@ LAUNCHER
 }
 
 enable_client_services() {
+    if is_docker; then
+        # No local audio client in Docker containers
+        return
+    fi
     local systemd_dir="/home/${KIOSK_USER}/.config/systemd/user"
     mkdir -p "$systemd_dir"
 
@@ -3453,12 +3709,24 @@ setup_internet_access() {
 # ================================================================
 
 install_full() {
+    if is_docker; then
+        # In Docker: server is pre-installed, just configure
+        print_header "Server Configuration"
+        install_asterisk_packages
+        configure_asterisk
+        INSTALLED_SERVER="y"
+        ENABLE_TLS="n"
+        save_config
+        print_success "Server configured"
+        return
+    fi
+
     print_header "Full Installation"
     local default_user="${SUDO_USER:-$USER}"
     read -p "Client User [$default_user]: " target_user
     KIOSK_USER="${target_user:-$default_user}"
     KIOSK_UID=$(id -u "$KIOSK_USER")
-    
+
     if ! collect_common_config; then return; fi
     collect_client_config
     install_dependencies
@@ -3486,6 +3754,11 @@ install_full() {
 }
 
 install_server_only() {
+    if is_docker; then
+        install_full
+        return
+    fi
+
     print_header "Server Installation"
     ASTERISK_HOST="127.0.0.1"
     ENABLE_TLS="n"  # LAN-only by default, set to "y" only if internet/certs setup is run
@@ -3578,10 +3851,18 @@ collect_client_config() {
 
 install_dependencies() {
     install_asterisk_packages
-    install_baresip_packages
+    if ! is_docker; then
+        install_baresip_packages
+    fi
 }
 
 install_asterisk_packages() {
+    if is_docker; then
+        # In Docker, packages are pre-installed via Dockerfile
+        print_info "Docker mode: packages pre-installed"
+        mkdir -p /var/lib/asterisk /var/log/asterisk /var/spool/asterisk /var/run/asterisk
+        return
+    fi
     echo "exit 101" > /usr/sbin/policy-rc.d
     chmod +x /usr/sbin/policy-rc.d
     apt update
@@ -3595,11 +3876,45 @@ install_asterisk_packages() {
 }
 
 install_baresip_packages() {
+    if is_docker; then
+        # Baresip (local SIP client) is not used inside the container
+        print_info "Docker mode: Baresip not applicable (use mobile/desktop SIP clients)"
+        return
+    fi
     apt update
     apt install -y baresip baresip-core pipewire pipewire-alsa pipewire-pulse wireplumber alsa-utils evtest || true
 }
 
 uninstall_menu() {
+    if is_docker; then
+        print_header "Reset Configuration"
+        echo "  In Docker, the container is ephemeral."
+        echo "  To fully uninstall: docker compose down -v"
+        echo ""
+        echo "  1) Reset all configs (keep container)"
+        echo "  2) Reset devices only"
+        echo "  0) Cancel"
+        read -p "Select: " ch
+        case $ch in
+            1)
+                rm -rf /etc/easy-asterisk/*
+                print_success "Configuration reset. Restart container to regenerate defaults."
+                ;;
+            2)
+                if [[ -f /etc/asterisk/pjsip.conf ]]; then
+                    # Remove device sections, keep transport config
+                    local temp="/tmp/pjsip_base_$$.conf"
+                    awk '/^; === Device:/{exit} {print}' /etc/asterisk/pjsip.conf > "$temp"
+                    mv "$temp" /etc/asterisk/pjsip.conf
+                    chown asterisk:asterisk /etc/asterisk/pjsip.conf
+                    asterisk -rx "pjsip reload" >/dev/null 2>&1 || true
+                fi
+                print_success "All devices removed"
+                ;;
+        esac
+        return
+    fi
+
     print_header "Uninstall"
     echo "  1) Remove Everything"
     echo "  2) Asterisk Only"
@@ -3646,29 +3961,65 @@ show_main_menu() {
     print_header "Easy Asterisk v${SCRIPT_VERSION}"
 
     load_config
-    echo "  Status:"
-    if [[ -f "$CONFIG_FILE" ]]; then
-        [[ "$INSTALLED_SERVER" == "y" ]] && echo -e "    Server: ${GREEN}Installed${NC}" || echo -e "    Server: ${YELLOW}Not installed${NC}"
-        [[ "$INSTALLED_CLIENT" == "y" ]] && echo -e "    Client: ${GREEN}Installed${NC}" || echo -e "    Client: ${YELLOW}Not installed${NC}"
+
+    if is_docker; then
+        # Docker status display
+        echo "  Status:"
+        echo -e "    Mode: ${CYAN}Docker Container${NC}"
+        if asterisk_running; then
+            echo -e "    Asterisk: ${GREEN}Running${NC}"
+        else
+            echo -e "    Asterisk: ${RED}Not running${NC}"
+        fi
+        if webadmin_running; then
+            echo -e "    Web Admin: ${GREEN}Running${NC} (port ${WEB_ADMIN_PORT})"
+        else
+            echo -e "    Web Admin: ${YELLOW}Stopped${NC}"
+        fi
         [[ -n "$DOMAIN_NAME" ]] && echo -e "    Domain: ${DOMAIN_NAME}"
-    else
-        echo -e "    ${YELLOW}Not configured${NC}"
-    fi
-    echo ""
-    
-    declare -A menu_map
-    local count=1
-    
-    echo "  ${count}) Install/Configure"; menu_map[$count]="submenu_install"; ((count++))
-    if [[ "$INSTALLED_SERVER" == "y" ]]; then
+        if [[ "$TURN_ENABLED" == "y" ]]; then
+            echo -e "    TURN:       ${GREEN}Enabled${NC} (${TURN_SERVER:-auto})"
+        elif [[ "$VPN_ICE_ENABLED" == "y" ]]; then
+            echo -e "    STUN/ICE:   ${GREEN}Enabled${NC} (${CUSTOM_STUN_SERVER:-auto})"
+        fi
+        echo ""
+
+        declare -A menu_map
+        local count=1
+
+        if [[ "$INSTALLED_SERVER" != "y" ]]; then
+            echo "  ${count}) Configure Server"; menu_map[$count]="submenu_install"; ((count++))
+        fi
         echo "  ${count}) Server Settings"; menu_map[$count]="submenu_server"; ((count++))
         echo "  ${count}) Device Management"; menu_map[$count]="submenu_devices"; ((count++))
+        echo "  ${count}) Tools"; menu_map[$count]="submenu_tools"; ((count++))
+        echo "  0) Exit"
+    else
+        # Bare metal status display
+        echo "  Status:"
+        if [[ -f "$CONFIG_FILE" ]]; then
+            [[ "$INSTALLED_SERVER" == "y" ]] && echo -e "    Server: ${GREEN}Installed${NC}" || echo -e "    Server: ${YELLOW}Not installed${NC}"
+            [[ "$INSTALLED_CLIENT" == "y" ]] && echo -e "    Client: ${GREEN}Installed${NC}" || echo -e "    Client: ${YELLOW}Not installed${NC}"
+            [[ -n "$DOMAIN_NAME" ]] && echo -e "    Domain: ${DOMAIN_NAME}"
+        else
+            echo -e "    ${YELLOW}Not configured${NC}"
+        fi
+        echo ""
+
+        declare -A menu_map
+        local count=1
+
+        echo "  ${count}) Install/Configure"; menu_map[$count]="submenu_install"; ((count++))
+        if [[ "$INSTALLED_SERVER" == "y" ]]; then
+            echo "  ${count}) Server Settings"; menu_map[$count]="submenu_server"; ((count++))
+            echo "  ${count}) Device Management"; menu_map[$count]="submenu_devices"; ((count++))
+        fi
+        echo "  ${count}) Client Settings"; menu_map[$count]="submenu_client"; ((count++))
+        echo "  ${count}) Tools"; menu_map[$count]="submenu_tools"; ((count++))
+        echo "  0) Exit"
     fi
-    echo "  ${count}) Client Settings"; menu_map[$count]="submenu_client"; ((count++))
-    echo "  ${count}) Tools"; menu_map[$count]="submenu_tools"; ((count++))
-    echo "  0) Exit"
     echo ""
-    
+
     read -p "  Select: " choice
     [[ "$choice" == "0" ]] && exit 0
     local action=${menu_map[$choice]}
@@ -3677,6 +4028,20 @@ show_main_menu() {
 }
 
 submenu_install() {
+    if is_docker; then
+        clear
+        print_header "Configure Server"
+        echo "  1) Configure/Reconfigure Server"
+        echo "  2) Reset Configuration"
+        echo "  0) Back"
+        read -p "  Select: " choice
+        case $choice in
+            1) install_full; read -p "Press Enter..." ;;
+            2) uninstall_menu; read -p "Press Enter..." ;;
+        esac
+        return
+    fi
+
     clear
     print_header "Install"
     echo "  1) Full (server + client)"
@@ -4297,6 +4662,22 @@ def add_device(name, category, extension, conn_type='lan', auto_answer=None):
     password = generate_password()
 
     # Determine transport and encryption
+    # Check if VPN ICE mode is enabled (for third-party VPNs)
+    vpn_ice = 'n'
+    turn_enabled = 'n'
+    is_container = os.path.exists('/.dockerenv')
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r') as cf:
+            for cline in cf:
+                if cline.startswith('VPN_ICE_ENABLED='):
+                    vpn_ice = cline.strip().split('=', 1)[1].strip('"')
+                elif cline.startswith('TURN_ENABLED='):
+                    turn_enabled = cline.strip().split('=', 1)[1].strip('"')
+
+    # In Docker: always use FQDN mode for web-created devices
+    if is_container and conn_type == 'lan':
+        conn_type = 'fqdn'
+
     if conn_type == 'fqdn':
         transport = 'transport=transport-tls'
         encryption = 'media_encryption=sdes'
@@ -4304,13 +4685,18 @@ def add_device(name, category, extension, conn_type='lan', auto_answer=None):
     else:
         transport = 'transport=transport-udp'
         encryption = 'media_encryption=no'
-        ice = ''
+        ice = 'ice_support=yes' if (vpn_ice == 'y' or turn_enabled == 'y') else ''
 
     aa_tag = ''
     if auto_answer == 'yes':
         aa_tag = '[AA:yes] '
     elif auto_answer == 'no':
         aa_tag = '[AA:no] '
+
+    # Mobile devices get keepalive settings for NAT traversal
+    keepalive = ''
+    if category == 'mobile':
+        keepalive = 'rtp_keepalive=15\nrtp_timeout=120\nrtp_timeout_hold=120'
 
     device_config = f'''
 ; === Device: {name} ({category}) {aa_tag}===
@@ -4328,6 +4714,7 @@ direct_media=no
 rtp_symmetric=yes
 force_rport=yes
 rewrite_contact=yes
+{keepalive}
 {ice}
 auth={extension}
 aors={extension}
@@ -4343,7 +4730,7 @@ password={password}
 type=aor
 max_contacts=5
 remove_existing=yes
-qualify_frequency=60
+qualify_frequency=30
 '''
 
     with open(PJSIP_CONF, 'a') as f:
@@ -5606,6 +5993,11 @@ WEBADMIN
 }
 
 create_web_admin_service() {
+    if is_docker; then
+        # In Docker, web admin is managed as a background process, not a systemd service
+        print_success "Web admin service configured (Docker process mode)"
+        return
+    fi
     cat > "$WEB_ADMIN_SERVICE" << EOF
 [Unit]
 Description=Easy Asterisk Web Admin
@@ -5664,9 +6056,9 @@ web_admin_menu() {
 
     print_header "Web Admin Management"
 
-    # Check current status
+    # Check current status (Docker-aware)
     local status="stopped"
-    if systemctl is-active --quiet easy-asterisk-webadmin 2>/dev/null; then
+    if webadmin_running; then
         status="running"
     fi
 
@@ -5695,103 +6087,28 @@ web_admin_menu() {
     case $choice in
         1)
             # Stop any existing instance first
-            if systemctl is-active --quiet easy-asterisk-webadmin 2>/dev/null; then
-                print_info "Stopping existing instance..."
-                systemctl stop easy-asterisk-webadmin 2>/dev/null || true
-                sleep 1
-            fi
-            # Kill anything on our port
-            local port_pids=$(lsof -ti ":${WEB_ADMIN_PORT}" 2>/dev/null)
-            if [[ -n "$port_pids" ]]; then
-                echo "$port_pids" | xargs kill -9 2>/dev/null || true
-                sleep 1
-            fi
-
-            # Always regenerate script to ensure latest version
+            stop_webadmin 2>/dev/null
             print_info "Installing/updating web admin..."
-            create_web_admin_script
-            create_web_admin_service
-            if [[ ! -f "$WEB_ADMIN_HTPASSWD" ]] && [[ "${WEB_ADMIN_AUTH_DISABLED:-}" != "true" ]]; then
-                setup_web_admin_auth
-            fi
-            systemctl daemon-reload
-            systemctl enable easy-asterisk-webadmin
-            systemctl start easy-asterisk-webadmin
-            sleep 2
-            if systemctl is-active --quiet easy-asterisk-webadmin; then
-                print_success "Web Admin started"
+            start_webadmin
+            if webadmin_running; then
                 echo ""
                 echo "  Access at: http://${server_ip}:${WEB_ADMIN_PORT}/clients"
                 [[ -n "$DOMAIN_NAME" ]] && echo "  Or: http://${DOMAIN_NAME}:${WEB_ADMIN_PORT}/clients"
-            else
-                print_error "Failed to start. Check: journalctl -u easy-asterisk-webadmin"
             fi
             ;;
         2)
             print_info "Stopping web admin..."
-            echo ""
-
-            # Check what's on the port first
-            echo "  $ netstat -tlnp | grep ${WEB_ADMIN_PORT}"
-            netstat -tlnp 2>/dev/null | grep "${WEB_ADMIN_PORT}" || echo "    (nothing found)"
-            echo ""
-
-            # First stop attempt
-            echo "  $ systemctl stop easy-asterisk-webadmin"
-            systemctl stop easy-asterisk-webadmin 2>&1 || true
-            sleep 1
-
-            # Check port again
-            echo ""
-            echo "  $ netstat -tlnp | grep ${WEB_ADMIN_PORT}"
-            netstat -tlnp 2>/dev/null | grep "${WEB_ADMIN_PORT}" || echo "    (nothing found)"
-
-            # If still in use, stop again
-            if netstat -tlnp 2>/dev/null | grep -q ":${WEB_ADMIN_PORT}"; then
-                echo ""
-                echo "  Port still in use, running stop again..."
-                echo "  $ systemctl stop easy-asterisk-webadmin"
-                systemctl stop easy-asterisk-webadmin 2>&1 || true
-                sleep 1
-
-                echo ""
-                echo "  $ netstat -tlnp | grep ${WEB_ADMIN_PORT}"
-                netstat -tlnp 2>/dev/null | grep "${WEB_ADMIN_PORT}" || echo "    (nothing found)"
-            fi
-
-            # If STILL in use, kill processes
-            if netstat -tlnp 2>/dev/null | grep -q ":${WEB_ADMIN_PORT}"; then
-                echo ""
-                echo "  Still in use, killing processes..."
-                local pid=$(netstat -tlnp 2>/dev/null | grep ":${WEB_ADMIN_PORT}" | awk '{print $7}' | cut -d'/' -f1 | head -1)
-                if [[ -n "$pid" ]]; then
-                    echo "  $ kill -9 $pid"
-                    kill -9 "$pid" 2>&1 || true
-                    sleep 1
-                fi
-            fi
-
-            # Disable the service
-            systemctl disable easy-asterisk-webadmin 2>/dev/null || true
-
-            # Final verification
-            echo ""
-            echo "  Final check:"
-            echo "  $ netstat -tlnp | grep ${WEB_ADMIN_PORT}"
-            if netstat -tlnp 2>/dev/null | grep ":${WEB_ADMIN_PORT}"; then
-                print_error "Port ${WEB_ADMIN_PORT} still in use!"
-            else
-                echo "    (nothing found)"
-                print_success "Web Admin stopped"
+            stop_webadmin
+            if ! is_docker; then
+                systemctl disable easy-asterisk-webadmin 2>/dev/null || true
             fi
             ;;
         3)
-            systemctl restart easy-asterisk-webadmin
-            print_success "Web Admin restarted"
+            restart_webadmin
             ;;
         4)
             setup_web_admin_auth
-            systemctl restart easy-asterisk-webadmin 2>/dev/null
+            restart_webadmin
             ;;
         5)
             read -p "New port [${WEB_ADMIN_PORT}]: " new_port
@@ -5799,15 +6116,18 @@ web_admin_menu() {
             if [[ "$new_port" =~ ^[0-9]+$ ]] && [[ "$new_port" -ge 1024 ]] && [[ "$new_port" -le 65535 ]]; then
                 WEB_ADMIN_PORT="$new_port"
                 save_config
-                create_web_admin_service
-                systemctl restart easy-asterisk-webadmin 2>/dev/null
+                restart_webadmin
                 print_success "Port changed to $new_port"
             else
                 print_error "Invalid port (must be 1024-65535)"
             fi
             ;;
         6)
-            journalctl -u easy-asterisk-webadmin -n 50 --no-pager
+            if is_docker; then
+                echo "  In Docker, check logs with: docker logs easy-asterisk"
+            else
+                journalctl -u easy-asterisk-webadmin -n 50 --no-pager
+            fi
             ;;
         7)
             print_header "Reverse Proxy Setup (Caddy)"
@@ -5828,7 +6148,7 @@ web_admin_menu() {
                     WEB_ADMIN_AUTH_DISABLED="true"
                     save_config
                     create_web_admin_script
-                    systemctl restart easy-asterisk-webadmin 2>/dev/null || true
+                    restart_webadmin
                     print_success "Internal auth disabled. Use Caddy basic_auth for security."
                     ;;
                 2)
@@ -5838,7 +6158,7 @@ web_admin_menu() {
                     if [[ ! -f "$WEB_ADMIN_HTPASSWD" ]]; then
                         setup_web_admin_auth
                     fi
-                    systemctl restart easy-asterisk-webadmin 2>/dev/null || true
+                    restart_webadmin
                     print_success "Internal auth enabled"
                     ;;
                 3)
@@ -5867,6 +6187,206 @@ web_admin_menu() {
     esac
 }
 
+configure_vpn_stun_ice() {
+    load_config
+    clear
+    print_header "VPN STUN/ICE Configuration"
+
+    echo "  This configures ICE (Interactive Connectivity Establishment) and"
+    echo "  STUN (Session Traversal Utilities for NAT) for third-party VPNs."
+    echo ""
+    echo "  ─────────────────────────────────────────────────────────────"
+    echo "  When do you need this?"
+    echo ""
+    echo "  • Your VPN does NAT between endpoints (audio fails or is one-way)"
+    echo "  • Caller and receiver are on different VPN segments"
+    echo "  • Direct VPN routing doesn't work for UDP/RTP traffic"
+    echo ""
+    echo "  When do you NOT need this?"
+    echo ""
+    echo "  • VPN gives both sides IPs on the same subnet (direct routing)"
+    echo "  • Audio works fine without STUN"
+    echo "  ─────────────────────────────────────────────────────────────"
+    echo ""
+
+    local current_stun="${CUSTOM_STUN_SERVER:-Not configured}"
+    local current_ice="${VPN_ICE_ENABLED:-n}"
+    echo -e "  Current Status:"
+    echo -e "    VPN ICE: $([[ "$current_ice" == "y" ]] && echo "${GREEN}Enabled${NC}" || echo "${YELLOW}Disabled${NC}")"
+    echo -e "    STUN Server: ${CYAN}${current_stun}${NC}"
+    echo ""
+
+    echo "  1) Enable VPN ICE + self-hosted STUN (recommended for DNS filtering)"
+    echo "  2) Enable VPN ICE + Google STUN (requires DNS access)"
+    echo "  3) Enable VPN ICE + custom STUN server"
+    echo "  4) Disable VPN ICE (standard LAN mode)"
+    echo "  5) Test current STUN server"
+    echo "  6) Run VPN diagnostics"
+    echo "  7) Check DNS whitelist"
+    echo "  0) Back"
+    echo ""
+    read -p "  Select: " stun_choice
+
+    case $stun_choice in
+        1)
+            # Self-hosted STUN via coturn
+            local server_ip=$(hostname -I | awk '{print $1}')
+            echo ""
+            echo "  Self-hosted STUN uses coturn on this server (port 3478)."
+            echo "  No external DNS dependencies - everything by IP."
+            echo ""
+
+            # Detect VPN IPs for suggestion
+            local vpn_ip=""
+            while IFS= read -r line; do
+                local iface=$(echo "$line" | awk '{print $2}' | tr -d ':')
+                local ip_addr=$(echo "$line" | awk '{print $4}' | cut -d'/' -f1)
+                if [[ "$iface" =~ ^(tun|tap|wg|tailscale|utun|ppp|nordlynx) ]]; then
+                    vpn_ip="$ip_addr"
+                    break
+                fi
+            done < <(ip -o -f inet addr show scope global 2>/dev/null)
+
+            local suggested_ip="${vpn_ip:-$server_ip}"
+            read -p "  STUN server IP [${suggested_ip}]: " stun_ip
+            stun_ip="${stun_ip:-$suggested_ip}"
+
+            read -p "  STUN port [3478]: " stun_port
+            stun_port="${stun_port:-3478}"
+
+            VPN_ICE_ENABLED="y"
+            CUSTOM_STUN_SERVER="${stun_ip}:${stun_port}"
+            save_config
+            repair_core_configs
+            generate_pjsip_conf
+            asterisk -rx "core reload" >/dev/null 2>&1 || true
+
+            print_success "VPN ICE enabled with self-hosted STUN: ${CUSTOM_STUN_SERVER}"
+            echo ""
+            echo "  Make sure coturn is running on port ${stun_port}:"
+            echo "    Docker: docker compose --profile stun up -d"
+            echo "    Manual: apt install coturn && systemctl start coturn"
+            echo ""
+            echo "  Configure Sipnetic STUN server: ${CUSTOM_STUN_SERVER}"
+            ;;
+        2)
+            # Google STUN
+            echo ""
+            echo -e "  ${YELLOW}Requires DNS access to: stun.l.google.com${NC}"
+            echo "  Add this domain to your DNS whitelist on all networks"
+            echo "  (server, caller, and receiver)."
+            echo ""
+            read -p "  Continue? [y/N]: " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                VPN_ICE_ENABLED="y"
+                CUSTOM_STUN_SERVER="stun.l.google.com:19302"
+                save_config
+                repair_core_configs
+                generate_pjsip_conf
+                asterisk -rx "core reload" >/dev/null 2>&1 || true
+                print_success "VPN ICE enabled with Google STUN"
+                echo ""
+                echo "  DNS whitelist required: stun.l.google.com (UDP 19302)"
+            fi
+            ;;
+        3)
+            # Custom STUN
+            echo ""
+            read -p "  STUN server address (host:port): " custom_stun
+            if [[ -n "$custom_stun" ]]; then
+                VPN_ICE_ENABLED="y"
+                CUSTOM_STUN_SERVER="$custom_stun"
+                save_config
+                repair_core_configs
+                generate_pjsip_conf
+                asterisk -rx "core reload" >/dev/null 2>&1 || true
+                print_success "VPN ICE enabled with custom STUN: ${custom_stun}"
+            else
+                print_error "No STUN server specified"
+            fi
+            ;;
+        4)
+            # Disable
+            VPN_ICE_ENABLED="n"
+            CUSTOM_STUN_SERVER=""
+            save_config
+            repair_core_configs
+            generate_pjsip_conf
+            asterisk -rx "core reload" >/dev/null 2>&1 || true
+            print_success "VPN ICE disabled (standard LAN mode)"
+            ;;
+        5)
+            # Test STUN
+            echo ""
+            if [[ -n "$CUSTOM_STUN_SERVER" ]]; then
+                local stun_host=$(echo "$CUSTOM_STUN_SERVER" | cut -d: -f1)
+                local stun_port=$(echo "$CUSTOM_STUN_SERVER" | cut -d: -f2)
+                stun_port="${stun_port:-3478}"
+
+                echo "  Testing STUN server: ${CUSTOM_STUN_SERVER}"
+                echo ""
+
+                # DNS test
+                if [[ "$stun_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    print_success "STUN server is an IP address (no DNS needed)"
+                else
+                    if nslookup "$stun_host" >/dev/null 2>&1; then
+                        print_success "DNS resolves: ${stun_host}"
+                    else
+                        print_error "DNS BLOCKED: ${stun_host}"
+                        echo "  Add to DNS whitelist or use IP address instead"
+                    fi
+                fi
+
+                # Connectivity test
+                if ping -c 2 -W 3 "$stun_host" >/dev/null 2>&1; then
+                    print_success "STUN host reachable: ${stun_host}"
+                else
+                    print_warn "STUN host not pingable (may still work if ICMP blocked)"
+                fi
+
+                # Port test via Asterisk
+                if command -v asterisk &>/dev/null; then
+                    local rtp_check=$(asterisk -rx "rtp show settings" 2>/dev/null | grep -i "stun\|ice" || echo "")
+                    if [[ -n "$rtp_check" ]]; then
+                        echo ""
+                        echo "  Asterisk RTP settings:"
+                        echo "$rtp_check" | while IFS= read -r line; do
+                            echo "    $line"
+                        done
+                    fi
+                fi
+            else
+                print_warn "No STUN server configured"
+                echo "  Configure one using options 1-3 above"
+            fi
+            ;;
+        6)
+            # VPN diagnostics
+            if command -v vpn-diagnostics &>/dev/null; then
+                vpn-diagnostics
+            elif [[ -f /usr/local/bin/vpn-diagnostics ]]; then
+                bash /usr/local/bin/vpn-diagnostics
+            else
+                print_error "vpn-diagnostics not found"
+                echo "  Install: copy scripts/vpn-diagnostics.sh to /usr/local/bin/vpn-diagnostics"
+            fi
+            ;;
+        7)
+            # DNS whitelist
+            if command -v dns-whitelist &>/dev/null; then
+                dns-whitelist --check
+            elif [[ -f /usr/local/bin/dns-whitelist ]]; then
+                bash /usr/local/bin/dns-whitelist --check
+            else
+                print_error "dns-whitelist not found"
+                echo "  Install: copy scripts/dns-whitelist.sh to /usr/local/bin/dns-whitelist"
+            fi
+            ;;
+        0) return ;;
+    esac
+}
+
 submenu_server() {
     clear
     print_header "Server Settings"
@@ -5878,9 +6398,10 @@ submenu_server() {
     echo "  6) Verify CIDR/NAT config"
     echo "  7) Watch Live Logs"
     echo "  8) Router Doctor"
-    echo "  9) Configure VLAN Subnets"
+    echo "  9) Configure VLAN/VPN Subnets"
     echo " 10) Provisioning Manager"
     echo " 11) Web Admin (Client Management)"
+    echo " 12) VPN STUN/ICE Configuration"
     echo "  0) Back"
     read -p "  Select: " choice
     case $choice in
@@ -5895,6 +6416,7 @@ submenu_server() {
         9) configure_vlan_subnets ;;
         10) provisioning_manager_menu ;;
         11) web_admin_menu ;;
+        12) configure_vpn_stun_ice ;;
         0) return ;;
     esac
     [[ "$choice" != "0" ]] && read -p "Press Enter..."
@@ -6235,6 +6757,10 @@ submenu_client() {
 }
 
 fix_audio_manually() {
+    if is_docker; then
+        print_error "Audio management not available in Docker (no local audio hardware)"
+        return
+    fi
     print_header "Manual Audio Fix"
     load_config
     local t_user="${KIOSK_USER:-$SUDO_USER}"
@@ -6275,21 +6801,50 @@ fix_audio_manually() {
 submenu_tools() {
     clear
     print_header "Tools"
-    echo "  1) Audio Test"
-    echo "  2) Verify Audio/Codec Setup"
-    echo "  3) Fix Audio (Unmute & Restart)"
-    echo "  4) Room Directory"
-    echo "  5) Manual Update Asterisk"
-    echo "  0) Back"
-    read -p "  Select: " choice
-    case $choice in
-        1) run_audio_test ;;
-        2) verify_audio_setup ;;
-        3) fix_audio_manually ;;
-        4) show_room_directory ;;
-        5) manual_update_asterisk ;;
-        0) return ;;
-    esac
+
+    if is_docker; then
+        echo "  1) Room Directory"
+        echo "  2) Update Asterisk (Docker)"
+        echo "  3) VPN Diagnostics"
+        echo "  4) DNS Whitelist Check"
+        echo "  0) Back"
+        read -p "  Select: " choice
+        case $choice in
+            1) show_room_directory ;;
+            2) manual_update_asterisk ;;
+            3)
+                if [[ -f /usr/local/bin/vpn-diagnostics ]]; then
+                    bash /usr/local/bin/vpn-diagnostics
+                else
+                    print_error "vpn-diagnostics not found"
+                fi
+                ;;
+            4)
+                if [[ -f /usr/local/bin/dns-whitelist ]]; then
+                    bash /usr/local/bin/dns-whitelist --check
+                else
+                    print_error "dns-whitelist not found"
+                fi
+                ;;
+            0) return ;;
+        esac
+    else
+        echo "  1) Audio Test"
+        echo "  2) Verify Audio/Codec Setup"
+        echo "  3) Fix Audio (Unmute & Restart)"
+        echo "  4) Room Directory"
+        echo "  5) Manual Update Asterisk"
+        echo "  0) Back"
+        read -p "  Select: " choice
+        case $choice in
+            1) run_audio_test ;;
+            2) verify_audio_setup ;;
+            3) fix_audio_manually ;;
+            4) show_room_directory ;;
+            5) manual_update_asterisk ;;
+            0) return ;;
+        esac
+    fi
     [[ "$choice" != "0" ]] && read -p "Press Enter..."
     [[ "$choice" != "0" ]] && submenu_tools
 }

@@ -599,6 +599,70 @@ nc -v pbx.yourhouse.com 5061
 
 If this fails, your port forwarding isn't set up correctly on your router.
 
+### "Mobile devices on VPN can't reach Asterisk" (VPN Issues)
+
+When mobile devices connect through a VPN (Tailscale, WireGuard, etc.), Asterisk needs to know about the VPN subnet. Without this, VPN-connected devices appear offline.
+
+**Fix:**
+
+1. Run the installer: `sudo ./easy-asterisk-v0.10.0.sh`
+2. Go to: **Server Settings > Configure VLAN/VPN Subnets**
+3. Answer "y" when asked about VLANs/VPNs
+4. Add your VPN subnet(s):
+   - **Tailscale**: `100.64.0.0/10`
+   - **WireGuard**: Usually `10.x.x.x/24` (check your WireGuard config)
+   - **OpenVPN**: Check your VPN config for the tunnel subnet
+5. The script will auto-detect VPN interfaces on the server and suggest subnets
+
+**Important:** The Asterisk server itself must also be on the VPN. If using Tailscale, install Tailscale on the server too. Mobile devices should connect to the server's **VPN IP** (e.g., `100.x.x.x` for Tailscale), not its LAN IP.
+
+**Verify VPN connectivity:**
+```bash
+# On the mobile device (or from another VPN device), ping the server's VPN IP
+ping 100.x.x.x
+
+# Test SIP port through VPN
+nc -u -v 100.x.x.x 5060
+```
+
+### "One-way audio when switching from WiFi to mobile data"
+
+This is a known issue with SIP clients on mobile devices. When the phone switches networks (WiFi to cellular or vice versa), the phone's IP address changes but the active audio stream may not update properly.
+
+**What happens:**
+- The phone switches to mobile data and gets a new IP
+- SIP signaling may update, but the audio (RTP) stream still uses the old path
+- Result: the caller can't be heard by the receiving person
+
+**Server-side fixes (already applied for mobile devices in v0.10.0):**
+- `rtp_symmetric=yes` - Asterisk sends audio back to wherever it receives audio from
+- `rtp_keepalive=15` - Asterisk sends periodic keepalive packets to maintain NAT mappings
+- `rtp_timeout=120` - Detects dead audio streams after 120 seconds
+- `qualify_frequency=30` - Checks device availability every 30 seconds
+
+**Client-side fixes (on your phone):**
+
+For **Sipnetic**:
+- Settings > Network > Enable "ICE" (if available)
+- Settings > Network > Enable "STUN" (if available)
+- Settings > Network > Keep-alive interval: 15-30 seconds
+- Make sure "Background mode" is enabled
+
+For **Linphone**:
+- Settings > Network > Enable ICE
+- Settings > Network > STUN server: `stun.l.google.com:19302`
+- Settings > Network > Enable TURN (if behind strict NAT)
+
+For **any SIP app**:
+- Disable WiFi sleep / battery optimization for the app
+- Enable "Keep WiFi on during sleep" in Android settings
+- After switching networks, hang up and redial - this forces a clean reconnection
+
+**If the problem persists:**
+- Consider using FQDN mode with TLS/SRTP instead of LAN/VPN mode
+- FQDN mode enables ICE (Interactive Connectivity Establishment) which handles network changes better
+- Alternatively, keep your phone on one network type (WiFi or mobile data) during calls
+
 ### "My IP changed and FQDN stopped working"
 
 See [Dynamic IP Handling](#dynamic-ip-handling) section. You need to set up DDNS.

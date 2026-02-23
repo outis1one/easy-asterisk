@@ -1,0 +1,327 @@
+#!/bin/bash
+# ================================================================
+# Easy Asterisk Docker Entrypoint
+#
+# Fully automated:
+#   - Detects public IP
+#   - Generates TURN credentials if not provided
+#   - Configures Asterisk with FQDN, TLS, ICE, STUN, TURN
+#   - Starts web admin + Asterisk
+# ================================================================
+
+set -e
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+log_info() { echo -e "${GREEN}[entrypoint]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[entrypoint]${NC} $1"; }
+log_error() { echo -e "${RED}[entrypoint]${NC} $1"; }
+
+CONFIG_DIR="/etc/easy-asterisk"
+CONFIG_FILE="${CONFIG_DIR}/config"
+WEB_ADMIN_SCRIPT="/usr/local/bin/easy-asterisk-webadmin"
+
+# ── Helper: generate random password ─────────────────────────
+gen_password() {
+    openssl rand -base64 18 | tr -dc 'a-zA-Z0-9' | head -c 24
+}
+
+# ── 1. Ensure asterisk user exists ───────────────────────────
+if ! id asterisk >/dev/null 2>&1; then
+    useradd -r -s /bin/false -d /var/lib/asterisk asterisk 2>/dev/null || true
+fi
+
+# ── 2. Detect public IP ──────────────────────────────────────
+PUBLIC_IP="${PUBLIC_IP:-}"
+if [[ -z "$PUBLIC_IP" ]]; then
+    log_info "Auto-detecting public IP..."
+    PUBLIC_IP=$(curl -s -4 --connect-timeout 5 ifconfig.me 2>/dev/null || true)
+    if [[ -z "$PUBLIC_IP" ]]; then
+        PUBLIC_IP=$(curl -s -4 --connect-timeout 5 icanhazip.com 2>/dev/null || true)
+    fi
+    if [[ -z "$PUBLIC_IP" ]]; then
+        PUBLIC_IP=$(curl -s -4 --connect-timeout 5 api.ipify.org 2>/dev/null || true)
+    fi
+fi
+
+if [[ -n "$PUBLIC_IP" ]]; then
+    log_info "Public IP: ${PUBLIC_IP}"
+else
+    log_warn "Could not detect public IP. Set PUBLIC_IP in .env"
+fi
+
+# ── 3. Generate TURN password if not provided ─────────────────
+TURN_USERNAME="${TURN_USERNAME:-easyasterisk}"
+if [[ -z "${TURN_PASSWORD:-}" ]] || [[ "${TURN_PASSWORD}" == "changeme" ]]; then
+    # Check if we already generated one previously
+    if [[ -f "$CONFIG_FILE" ]] && grep -q "^TURN_PASSWORD=" "$CONFIG_FILE"; then
+        TURN_PASSWORD=$(grep "^TURN_PASSWORD=" "$CONFIG_FILE" | cut -d'"' -f2)
+    fi
+    if [[ -z "${TURN_PASSWORD:-}" ]] || [[ "${TURN_PASSWORD}" == "changeme" ]]; then
+        TURN_PASSWORD=$(gen_password)
+        log_info "Generated TURN password (saved to config)"
+    fi
+fi
+
+# ── 4. Detect local network ──────────────────────────────────
+local_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+raw_cidr=$(ip -o -f inet addr show 2>/dev/null | awk '/scope global/ {print $4}' | head -1)
+default_cidr="$raw_cidr"
+if [[ "$raw_cidr" =~ \.([0-9]+)/([0-9]+)$ ]]; then
+    default_cidr="${raw_cidr%.*}.0/${BASH_REMATCH[2]}"
+fi
+
+# ── 5. Generate self-signed certs if missing ──────────────────
+if [[ ! -f /etc/asterisk/certs/server.crt ]]; then
+    log_info "Generating self-signed TLS certificate..."
+    mkdir -p /etc/asterisk/certs
+    # Use DOMAIN_NAME as CN if available
+    cn="${DOMAIN_NAME:-asterisk-local}"
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+        -keyout /etc/asterisk/certs/server.key \
+        -out /etc/asterisk/certs/server.crt \
+        -subj "/CN=${cn}" 2>/dev/null
+    chown asterisk:asterisk /etc/asterisk/certs/server.*
+    chmod 644 /etc/asterisk/certs/server.crt
+    chmod 600 /etc/asterisk/certs/server.key
+fi
+
+# ── 6. Write config file ─────────────────────────────────────
+mkdir -p "$CONFIG_DIR"
+
+# Determine TURN/STUN server address
+turn_server="${TURN_SERVER:-${DOMAIN_NAME:-$local_ip}:3478}"
+
+cat > "$CONFIG_FILE" << EOF
+# Easy Asterisk Configuration (Docker) - $(date)
+KIOSK_USER=""
+KIOSK_UID=""
+KIOSK_EXTENSION=""
+KIOSK_NAME=""
+SIP_PASSWORD=""
+ASTERISK_HOST="${DOMAIN_NAME:-$local_ip}"
+DOMAIN_NAME="${DOMAIN_NAME:-}"
+ENABLE_TLS="${ENABLE_TLS:-y}"
+HAS_VLANS="${HAS_VLANS:-n}"
+VLAN_SUBNETS="${VLAN_SUBNETS:-}"
+CERT_PATH=""
+KEY_PATH=""
+INSTALLED_SERVER="y"
+INSTALLED_CLIENT="n"
+CURRENT_PUBLIC_IP="${PUBLIC_IP}"
+PTT_DEVICE=""
+PTT_KEYCODE=""
+LOCAL_CIDR="${LOCAL_CIDR:-$default_cidr}"
+WEB_ADMIN_PORT="${WEB_ADMIN_PORT:-8080}"
+WEB_ADMIN_AUTH_DISABLED="${WEB_ADMIN_AUTH_DISABLED:-false}"
+VPN_ICE_ENABLED="y"
+CUSTOM_STUN_SERVER="${turn_server}"
+TURN_ENABLED="y"
+TURN_SERVER="${turn_server}"
+TURN_USERNAME="${TURN_USERNAME}"
+TURN_PASSWORD="${TURN_PASSWORD}"
+EOF
+chmod 644 "$CONFIG_FILE"
+
+# ── 7. Initialize categories & rooms if missing ──────────────
+CATEGORIES_FILE="${CONFIG_DIR}/categories.conf"
+if [[ ! -f "$CATEGORIES_FILE" ]]; then
+    log_info "Creating default device categories..."
+    cat > "$CATEGORIES_FILE" << 'EOF'
+kiosks|Kiosks|yes|Fixed wall-mount tablets & intercoms
+mobile|Mobile|no|Phones & tablets (ring normally)
+custom|Custom|no|Custom configuration
+EOF
+fi
+
+ROOMS_FILE="${CONFIG_DIR}/rooms.conf"
+if [[ ! -f "$ROOMS_FILE" ]]; then
+    cat > "$ROOMS_FILE" << 'EOF'
+# ext|name|members|timeout|type
+EOF
+fi
+
+# ── 8. Generate Asterisk configs ─────────────────────────────
+
+# Build local_net entries
+all_local_nets="local_net=${LOCAL_CIDR:-$default_cidr}"
+if [[ "${HAS_VLANS:-n}" == "y" && -n "${VLAN_SUBNETS:-}" ]]; then
+    for subnet in $VLAN_SUBNETS; do
+        all_local_nets="${all_local_nets}
+local_net=${subnet}"
+    done
+fi
+
+# NAT settings - always include external addresses for FQDN mode
+nat_settings=""
+if [[ -n "$PUBLIC_IP" ]]; then
+    nat_settings="external_media_address=${PUBLIC_IP}
+external_signaling_address=${PUBLIC_IP}
+${all_local_nets}"
+else
+    nat_settings="${all_local_nets}"
+fi
+
+# ── pjsip.conf (only if empty/missing - preserves existing devices) ──
+if [[ ! -f /etc/asterisk/pjsip.conf ]] || [[ ! -s /etc/asterisk/pjsip.conf ]]; then
+    log_info "Generating PJSIP configuration..."
+    cat > /etc/asterisk/pjsip.conf << EOF
+; Easy Asterisk (Docker) - FQDN: ${DOMAIN_NAME:-none}
+[global]
+type=global
+user_agent=EasyAsterisk
+
+[transport-udp]
+type=transport
+protocol=udp
+bind=0.0.0.0:5060
+; Server IP: ${local_ip} | Public IP: ${PUBLIC_IP:-unknown}
+${nat_settings}
+
+[transport-tcp]
+type=transport
+protocol=tcp
+bind=0.0.0.0:5060
+; Server IP: ${local_ip} | Public IP: ${PUBLIC_IP:-unknown}
+${nat_settings}
+
+[transport-tls]
+type=transport
+protocol=tls
+bind=0.0.0.0:5061
+; Server IP: ${local_ip} | Public IP: ${PUBLIC_IP:-unknown}
+cert_file=/etc/asterisk/certs/server.crt
+priv_key_file=/etc/asterisk/certs/server.key
+ca_list_file=/etc/ssl/certs/ca-certificates.crt
+method=tlsv1_2
+${nat_settings}
+
+EOF
+    chown asterisk:asterisk /etc/asterisk/pjsip.conf
+else
+    # Update NAT settings in existing pjsip.conf transports if public IP changed
+    if [[ -n "$PUBLIC_IP" ]]; then
+        current_ext=$(grep "^external_media_address=" /etc/asterisk/pjsip.conf 2>/dev/null | head -1 | cut -d= -f2)
+        if [[ "$current_ext" != "$PUBLIC_IP" && -n "$current_ext" ]]; then
+            log_info "Updating public IP in pjsip.conf: ${current_ext} -> ${PUBLIC_IP}"
+            sed -i "s|external_media_address=.*|external_media_address=${PUBLIC_IP}|g" /etc/asterisk/pjsip.conf
+            sed -i "s|external_signaling_address=.*|external_signaling_address=${PUBLIC_IP}|g" /etc/asterisk/pjsip.conf
+        fi
+    fi
+fi
+
+# ── rtp.conf (always regenerated - includes TURN credentials) ──
+log_info "Configuring RTP with ICE + STUN + TURN..."
+cat > /etc/asterisk/rtp.conf << EOF
+[general]
+rtpstart=${RTP_START:-10000}
+rtpend=${RTP_END:-20000}
+strictrtp=yes
+icesupport=yes
+stunaddr=${turn_server}
+turnaddr=${turn_server}
+turnusername=${TURN_USERNAME}
+turnpassword=${TURN_PASSWORD}
+EOF
+chown asterisk:asterisk /etc/asterisk/rtp.conf
+
+# ── extensions.conf (only if missing) ──
+if [[ ! -f /etc/asterisk/extensions.conf ]] || [[ ! -s /etc/asterisk/extensions.conf ]]; then
+    log_info "Generating dialplan..."
+    cat > /etc/asterisk/extensions.conf << 'EOF'
+[general]
+static=yes
+writeprotect=no
+[default]
+exten => _X.,1,Hangup()
+[intercom]
+EOF
+    chown asterisk:asterisk /etc/asterisk/extensions.conf
+fi
+
+# ── Other core configs (only if missing) ──
+if [[ ! -f /etc/asterisk/asterisk.conf ]]; then
+    cat > /etc/asterisk/asterisk.conf << 'EOF'
+[directories]
+[options]
+runuser = asterisk
+rungroup = asterisk
+EOF
+fi
+
+if [[ ! -f /etc/asterisk/logger.conf ]]; then
+    cat > /etc/asterisk/logger.conf << 'EOF'
+[general]
+[logfiles]
+console => notice,warning,error
+EOF
+fi
+
+if [[ ! -f /etc/asterisk/modules.conf ]]; then
+    cat > /etc/asterisk/modules.conf << 'EOF'
+[modules]
+autoload=yes
+noload => chan_sip.so
+noload => chan_iax2.so
+load => res_pjsip.so
+load => res_pjsip_session.so
+load => res_pjsip_logger.so
+load => chan_pjsip.so
+load => codec_ulaw.so
+load => codec_alaw.so
+load => codec_g722.so
+load => codec_opus.so
+load => res_rtp_asterisk.so
+load => app_dial.so
+load => app_page.so
+load => pbx_config.so
+EOF
+fi
+
+# ── 9. Fix permissions ───────────────────────────────────────
+chown -R asterisk:asterisk /etc/asterisk /var/lib/asterisk /var/log/asterisk /var/spool/asterisk /var/run/asterisk 2>/dev/null || true
+
+# ── 10. Start Web Admin in background ─────────────────────────
+# The web admin script is generated by the 'easy-asterisk' management tool.
+# On first run: docker exec -it easy-asterisk easy-asterisk → Web Admin menu → Start
+if [[ -f "$WEB_ADMIN_SCRIPT" ]]; then
+    log_info "Starting Web Admin on port ${WEB_ADMIN_PORT:-8080}..."
+    WEBADMIN_PORT="${WEB_ADMIN_PORT:-8080}" \
+    WEBADMIN_AUTH_DISABLED="${WEB_ADMIN_AUTH_DISABLED:-false}" \
+    python3 "$WEB_ADMIN_SCRIPT" &
+fi
+
+# ── 11. Signal handling for clean shutdown ────────────────────
+cleanup() {
+    log_info "Shutting down..."
+    pkill -f "easy-asterisk-webadmin" 2>/dev/null || true
+    asterisk -rx "core stop now" 2>/dev/null || true
+    exit 0
+}
+trap cleanup SIGTERM SIGINT
+
+# ── 12. Start Asterisk ───────────────────────────────────────
+log_info "Starting Asterisk PBX..."
+echo ""
+echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}  Easy Asterisk (Docker)${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
+echo -e "  FQDN:         ${GREEN}${DOMAIN_NAME:-not set}${NC}"
+echo -e "  Public IP:    ${GREEN}${PUBLIC_IP:-unknown}${NC}"
+echo -e "  TURN/STUN:    ${GREEN}${turn_server}${NC}"
+echo -e "  TLS:          ${GREEN}Enabled (port 5061)${NC}"
+echo -e "  ICE:          ${GREEN}Enabled${NC}"
+echo -e "${CYAN}──────────────────────────────────────────────────────────────${NC}"
+echo -e "  SIP clients connect to: ${GREEN}${DOMAIN_NAME:-$local_ip}:5061${NC} (TLS)"
+echo -e "  Web Admin:    ${GREEN}http://${local_ip}:${WEB_ADMIN_PORT:-8080}/clients${NC}"
+echo -e "${CYAN}──────────────────────────────────────────────────────────────${NC}"
+echo -e "  Management:   docker exec -it easy-asterisk easy-asterisk"
+echo -e "  Diagnostics:  docker exec -it easy-asterisk vpn-diagnostics"
+echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
+echo ""
+
+exec asterisk -f -U asterisk -G asterisk
