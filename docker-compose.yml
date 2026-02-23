@@ -101,10 +101,11 @@ services:
         exec turnserver $$ARGS
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "netstat -uln | grep -q ':3478'"]
-      interval: 30s
+      test: ["CMD", "turnutils_stunclient", "127.0.0.1"]
+      interval: 10s
       timeout: 5s
       retries: 3
+      start_period: 10s
 
 volumes:
   asterisk-config:
