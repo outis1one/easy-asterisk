@@ -82,33 +82,22 @@ services:
     image: coturn/coturn:latest
     container_name: easy-asterisk-coturn
     network_mode: host
-    # Pass env vars into container, then use simple shell to build command
-    environment:
-      - TURN_USER=${TURN_USERNAME:-easyasterisk}
-      - TURN_PASS=${TURN_PASSWORD:-changeme}
-      - REALM=${DOMAIN_NAME:-localhost}
-      - MIN_PORT=${TURN_RELAY_MIN:-49152}
-      - MAX_PORT=${TURN_RELAY_MAX:-49252}
-      - EXT_IP=${PUBLIC_IP:-}
-    entrypoint: ["/bin/sh", "-c"]
+    # Uses the image's native docker-entrypoint.sh (no shell override)
+    # which prepends 'turnserver' when first arg starts with '-'
     command:
-      - |
-        EXTRA=""
-        if [ -n "$EXT_IP" ]; then
-          EXTRA="--external-ip=$EXT_IP"
-        fi
-        exec turnserver -n \
-          --listening-port=3478 \
-          --fingerprint \
-          --lt-cred-mech \
-          --user=$TURN_USER:$TURN_PASS \
-          --realm=$REALM \
-          --min-port=$MIN_PORT \
-          --max-port=$MAX_PORT \
-          --no-tls --no-dtls --no-cli \
-          --no-multicast-peers \
-          --log-file=stdout \
-          $EXTRA
+      - -n
+      - --listening-port=3478
+      - --fingerprint
+      - --lt-cred-mech
+      - --user=${TURN_USERNAME:-easyasterisk}:${TURN_PASSWORD:-changeme}
+      - --realm=${DOMAIN_NAME:-localhost}
+      - --min-port=${TURN_RELAY_MIN:-49152}
+      - --max-port=${TURN_RELAY_MAX:-49252}
+      - --no-tls
+      - --no-dtls
+      - --no-cli
+      - --no-multicast-peers
+      - --log-file=stdout
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "turnutils_stunclient 127.0.0.1 >/dev/null 2>&1"]
