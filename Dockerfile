@@ -79,7 +79,7 @@ EXPOSE 8080/tcp
 EXPOSE 8088/tcp
 EXPOSE 8089/tcp
 
-# STUN (if running coturn in same container)
+# STUN (if running coturn in same container; default 3478, configurable via TURN_PORT)
 EXPOSE 3478/udp
 
 # RTP media range (use --network host in production for full range)

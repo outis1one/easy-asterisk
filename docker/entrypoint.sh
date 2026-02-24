@@ -94,7 +94,7 @@ fi
 mkdir -p "$CONFIG_DIR"
 
 # Determine TURN/STUN server address
-turn_server="${TURN_SERVER:-${DOMAIN_NAME:-$local_ip}:3478}"
+turn_server="${TURN_SERVER:-${DOMAIN_NAME:-$local_ip}:${TURN_PORT:-3478}}"
 
 cat > "$CONFIG_FILE" << EOF
 # Easy Asterisk Configuration (Docker) - $(date)
