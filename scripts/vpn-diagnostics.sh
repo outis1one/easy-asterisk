@@ -127,6 +127,66 @@ else
     fail "pjsip.conf not found"
 fi
 
+# ── Test 2b: TLS Certificate & Port Checks ────────────────────
+echo ""
+echo -e "${BOLD}2b. TLS / Certificate Status${NC}"
+echo ""
+
+# Check if port 5061 is actually listening
+if command -v ss &>/dev/null; then
+    tls_listen=$(ss -tlnp 2>/dev/null | grep ":5061 " || true)
+elif command -v netstat &>/dev/null; then
+    tls_listen=$(netstat -tlnp 2>/dev/null | grep ":5061 " || true)
+else
+    tls_listen=""
+fi
+
+if [[ -n "$tls_listen" ]]; then
+    pass "Port 5061 (TLS) is listening"
+else
+    fail "Port 5061 (TLS) is NOT listening"
+    warn "Asterisk TLS transport failed to start — check certs and logs"
+fi
+
+# Check TLS cert
+cert_file="/etc/asterisk/certs/server.crt"
+if [[ -f "$cert_file" ]]; then
+    pass "TLS certificate exists: $cert_file"
+
+    # Check cert CN/SAN
+    cert_cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/.*CN *= *//')
+    cert_san=$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | grep -oP 'DNS:\K[^,]+' || true)
+    cert_expiry=$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | cut -d= -f2)
+
+    info "Cert CN: ${cert_cn:-unknown}"
+    if [[ -n "$cert_san" ]]; then
+        pass "Cert has SAN (Subject Alt Name): ${cert_san}"
+    else
+        fail "Cert has NO SAN — modern phones (iOS/Android) will reject it"
+        warn "Delete /etc/asterisk/certs/server.crt and restart to regenerate with SANs"
+    fi
+    info "Cert expires: ${cert_expiry:-unknown}"
+
+    # Check if cert is self-signed
+    issuer=$(openssl x509 -in "$cert_file" -noout -issuer 2>/dev/null | sed 's/.*CN *= *//')
+    if [[ "$issuer" == "$cert_cn" ]]; then
+        warn "Cert is SELF-SIGNED — phones must be set to accept self-signed certs"
+        info "In your SIP app: disable TLS certificate verification / allow self-signed"
+    fi
+
+    # Verify PJSIP transport loaded it
+    if command -v asterisk &>/dev/null; then
+        transport_status=$(asterisk -rx "pjsip show transports" 2>/dev/null || true)
+        if echo "$transport_status" | grep -q "transport-tls"; then
+            pass "PJSIP TLS transport is loaded"
+        else
+            fail "PJSIP TLS transport NOT loaded — cert may be invalid"
+        fi
+    fi
+else
+    fail "TLS certificate not found at $cert_file"
+fi
+
 # ── Test 3: Check RTP and ICE/STUN configuration ─────────────
 echo ""
 echo -e "${BOLD}3. RTP / ICE / STUN Configuration${NC}"

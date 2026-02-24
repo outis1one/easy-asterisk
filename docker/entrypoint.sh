@@ -75,16 +75,27 @@ if [[ "$raw_cidr" =~ \.([0-9]+)/([0-9]+)$ ]]; then
     default_cidr="${raw_cidr%.*}.0/${BASH_REMATCH[2]}"
 fi
 
-# ── 5. Generate self-signed certs if missing ──────────────────
+# ── 5. Generate self-signed certs ──────────────────────────────
+# Regenerate if missing OR if existing cert lacks SANs (modern TLS clients require them)
+regen_cert=false
 if [[ ! -f /etc/asterisk/certs/server.crt ]]; then
+    regen_cert=true
+elif ! openssl x509 -in /etc/asterisk/certs/server.crt -noout -ext subjectAltName 2>/dev/null | grep -q "DNS:"; then
+    log_info "Existing TLS cert lacks SANs — regenerating for mobile phone compatibility"
+    regen_cert=true
+fi
+
+if $regen_cert; then
     log_info "Generating self-signed TLS certificate..."
     mkdir -p /etc/asterisk/certs
-    # Use DOMAIN_NAME as CN if available
     cn="${DOMAIN_NAME:-asterisk-local}"
+    # Include Subject Alternative Names — required by modern TLS clients (iOS/Android SIP apps)
     openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
         -keyout /etc/asterisk/certs/server.key \
         -out /etc/asterisk/certs/server.crt \
-        -subj "/CN=${cn}" 2>/dev/null
+        -subj "/CN=${cn}" \
+        -addext "subjectAltName=DNS:${cn}${PUBLIC_IP:+,IP:${PUBLIC_IP}}" \
+        2>/dev/null
     chown asterisk:asterisk /etc/asterisk/certs/server.*
     chmod 644 /etc/asterisk/certs/server.crt
     chmod 600 /etc/asterisk/certs/server.key
@@ -287,13 +298,13 @@ rungroup = asterisk
 EOF
 fi
 
-if [[ ! -f /etc/asterisk/logger.conf ]]; then
-    cat > /etc/asterisk/logger.conf << 'EOF'
+# ── logger.conf (always regenerated - ensures security logging is on) ──
+cat > /etc/asterisk/logger.conf << 'EOF'
 [general]
 [logfiles]
-console => notice,warning,error
+; security level captures TLS handshake failures and auth issues
+console => notice,warning,error,security
 EOF
-fi
 
 # ── modules.conf (always regenerated - ensures chan_sip stays disabled) ──
 cat > /etc/asterisk/modules.conf << 'EOF'
@@ -368,6 +379,24 @@ for i in $(seq 1 60); do
     sleep 1
 done
 
+# Verify PJSIP transports are listening
+tls_ok=false
+udp_ok=false
+if asterisk -rx "pjsip show transports" 2>/dev/null | grep -q "transport-tls"; then
+    tls_ok=true
+fi
+if asterisk -rx "pjsip show transports" 2>/dev/null | grep -q "transport-udp"; then
+    udp_ok=true
+fi
+
+# Check if port 5061 is actually bound
+tls_listen=""
+if command -v ss &>/dev/null; then
+    tls_listen=$(ss -tlnp 2>/dev/null | grep ":5061 " || true)
+elif command -v netstat &>/dev/null; then
+    tls_listen=$(netstat -tlnp 2>/dev/null | grep ":5061 " || true)
+fi
+
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
 echo -e "${CYAN}  Easy Asterisk (Docker)${NC}"
@@ -375,7 +404,13 @@ echo -e "${CYAN}═════════════════════�
 echo -e "  FQDN:         ${GREEN}${DOMAIN_NAME:-not set}${NC}"
 echo -e "  Public IP:    ${GREEN}${PUBLIC_IP:-unknown}${NC}"
 echo -e "  TURN/STUN:    ${GREEN}${turn_server}${NC}"
-echo -e "  TLS:          ${GREEN}Enabled (port 5061)${NC}"
+if $tls_ok && [[ -n "$tls_listen" ]]; then
+    echo -e "  TLS:          ${GREEN}Enabled (port 5061)${NC}"
+elif $tls_ok; then
+    echo -e "  TLS:          ${YELLOW}Transport loaded but port 5061 not bound — check certs${NC}"
+else
+    echo -e "  TLS:          ${RED}NOT LOADED — check Asterisk logs${NC}"
+fi
 echo -e "  ICE:          ${GREEN}Enabled${NC}"
 echo -e "${CYAN}──────────────────────────────────────────────────────────────${NC}"
 echo -e "  SIP clients connect to: ${GREEN}${DOMAIN_NAME:-$local_ip}:5061${NC} (TLS)"
