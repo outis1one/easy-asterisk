@@ -82,8 +82,12 @@ services:
     image: coturn/coturn:latest
     container_name: easy-asterisk-coturn
     network_mode: host
-    # Uses the image's native docker-entrypoint.sh (no shell override)
-    # which prepends 'turnserver' when first arg starts with '-'
+    # The coturn image runs as nobody:nogroup by default, which cannot
+    # create /var/run/turnserver.pid. Run as root to avoid this.
+    user: root
+    environment:
+      # Image-native external IP detection (adds --external-ip automatically)
+      - DETECT_EXTERNAL_IP=${DETECT_EXTERNAL_IP:-yes}
     command:
       - -n
       - --listening-port=3478
