@@ -279,24 +279,22 @@ EOF
     chown asterisk:asterisk /etc/asterisk/pjsip.conf
 fi
 
-# ── rtp.conf (always regenerated - includes TURN credentials) ──
-# Use 127.0.0.1 for stunaddr/turnaddr because coturn runs on the same host
-# (network_mode: host). Using the FQDN would cause DNS resolution, and if the
-# DNS TTL is 0 Asterisk cancels recurring resolution — breaking ICE entirely
-# and adding a ~27-second timeout delay to every call.
-turn_port="${turn_server##*:}"
-local_turn="127.0.0.1:${turn_port:-3478}"
-log_info "Configuring RTP with ICE + STUN + TURN (local: ${local_turn})..."
+# ── rtp.conf (always regenerated) ──
+# ICE is enabled so Asterisk participates in ICE negotiation with clients.
+# stunaddr/turnaddr are NOT set here because:
+#   - Asterisk already knows its public IP via external_media_address in pjsip.conf
+#   - Its RTP ports are port-forwarded, so host candidates are sufficient
+#   - Setting stunaddr/turnaddr causes STUN/TURN gather timeouts (~27s per call)
+#     when the STUN/TURN server is unreachable or misconfigured
+# coturn is for SIP CLIENTS behind strict NAT — they configure TURN in their
+# own app settings, independently of Asterisk's rtp.conf.
+log_info "Configuring RTP with ICE support..."
 cat > /etc/asterisk/rtp.conf << EOF
 [general]
 rtpstart=${RTP_START:-10000}
 rtpend=${RTP_END:-20000}
 strictrtp=yes
 icesupport=yes
-stunaddr=${local_turn}
-turnaddr=${local_turn}
-turnusername=${TURN_USERNAME}
-turnpassword=${TURN_PASSWORD}
 EOF
 chown asterisk:asterisk /etc/asterisk/rtp.conf
 
