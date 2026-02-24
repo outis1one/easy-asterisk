@@ -308,7 +308,6 @@ load => chan_pjsip.so
 load => codec_ulaw.so
 load => codec_alaw.so
 load => codec_g722.so
-load => codec_opus.so
 load => res_rtp_asterisk.so
 load => app_dial.so
 load => app_page.so
@@ -340,6 +339,20 @@ trap cleanup SIGTERM SIGINT
 # ── 12. Start Asterisk ───────────────────────────────────────
 log_info "Starting Asterisk PBX..."
 echo ""
+
+# Start Asterisk in the background, then print management info once ready
+asterisk -f -U asterisk -G asterisk &
+ASTERISK_PID=$!
+
+# Wait for Asterisk to be ready (up to 60 seconds)
+for i in $(seq 1 60); do
+    if asterisk -rx "core show version" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
 echo -e "${CYAN}  Easy Asterisk (Docker)${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
@@ -352,9 +365,10 @@ echo -e "${CYAN}─────────────────────�
 echo -e "  SIP clients connect to: ${GREEN}${DOMAIN_NAME:-$local_ip}:5061${NC} (TLS)"
 echo -e "  Web Admin:    ${GREEN}http://${local_ip}:${WEB_ADMIN_PORT:-8080}/clients${NC}"
 echo -e "${CYAN}──────────────────────────────────────────────────────────────${NC}"
-echo -e "  Management:   docker exec -it easy-asterisk easy-asterisk"
+echo -e "  Management:   ${YELLOW}docker exec -it easy-asterisk easy-asterisk${NC}"
 echo -e "  Diagnostics:  docker exec -it easy-asterisk vpn-diagnostics"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
 echo ""
 
-exec asterisk -f -U asterisk -G asterisk
+# Wait for Asterisk process (keeps container running)
+wait $ASTERISK_PID
