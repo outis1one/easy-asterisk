@@ -39,19 +39,11 @@ RUN echo "exit 101" > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d &&
     && ldconfig \
     && update-ca-certificates 2>/dev/null || true
 
-# Install Opus codec (not included in Ubuntu 24.04 asterisk-modules, bug #2044135)
-# Download Digium's precompiled codec_opus for Asterisk 20 (Ubuntu 24.04 ships Asterisk 20)
-RUN MODULES_DIR=$(find /usr/lib -type d -name modules -path "*/asterisk/*" | head -1) && \
-    if [ -z "$MODULES_DIR" ]; then MODULES_DIR="/usr/lib/x86_64-linux-gnu/asterisk/modules"; fi && \
-    mkdir -p "$MODULES_DIR" /var/lib/asterisk/documentation/thirdparty && \
-    cd /tmp && \
-    wget -q "http://downloads.digium.com/pub/telephony/codec_opus/asterisk-20.0/x86-64/codec_opus-20.0_1.3.0-x86_64.tar.gz" -O codec_opus.tar.gz && \
-    tar -xzf codec_opus.tar.gz && \
-    find /tmp -name "codec_opus.so" -exec cp {} "$MODULES_DIR/" \; && \
-    find /tmp -name "format_ogg_opus.so" -exec cp {} "$MODULES_DIR/" \; && \
-    find /tmp -name "codec_opus_config-en_US.xml" -exec cp {} /var/lib/asterisk/documentation/thirdparty/ \; && \
-    rm -rf /tmp/codec_opus* && \
-    echo "Opus codec installed to $MODULES_DIR"
+# NOTE: Opus transcoding (codec_opus.so) is NOT available on Ubuntu 24.04 due to
+# a packaging bug (Launchpad #2044135). The Digium precompiled binary is ABI-incompatible.
+# Opus pass-through (phone-to-phone) still works via res_format_attr_opus.so from
+# asterisk-modules. Only Opus<->ulaw transcoding is missing, which is rarely needed
+# since modern SIP phones all support the same codecs natively.
 
 # Create required directories
 RUN mkdir -p \
