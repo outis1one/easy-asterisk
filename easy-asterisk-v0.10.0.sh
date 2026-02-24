@@ -3032,21 +3032,18 @@ transport=config,pjsip.conf,criteria=type=transport
 EOF
     fi
 
-    # ICE / STUN / TURN configuration
-    # Enabled for: FQDN/internet mode OR VPN with ICE enabled
+    # ICE configuration
+    # ICE is enabled so Asterisk participates in ICE negotiation with clients.
+    # stunaddr/turnaddr are NOT set because:
+    #   - Asterisk knows its public IP via external_media_address in pjsip.conf
+    #   - Its RTP ports are port-forwarded, so host candidates are sufficient
+    #   - Setting stunaddr/turnaddr causes STUN/TURN gather timeouts (~27s delay)
+    # coturn (if running) is for SIP clients behind strict NAT — they configure
+    # TURN in their own app settings, independently of Asterisk's rtp.conf.
     load_config
     local ice_config=""
     if [[ -n "$DOMAIN_NAME" ]] || [[ "$VPN_ICE_ENABLED" == "y" ]] || [[ "$TURN_ENABLED" == "y" ]]; then
-        local stun_addr="${TURN_SERVER:-${CUSTOM_STUN_SERVER:-stun.l.google.com:19302}}"
-        ice_config="icesupport=yes
-stunaddr=${stun_addr}"
-        # Add TURN relay if configured (required for calls through strict NAT/VPN)
-        if [[ "$TURN_ENABLED" == "y" && -n "$TURN_SERVER" && -n "$TURN_USERNAME" && -n "$TURN_PASSWORD" ]]; then
-            ice_config="${ice_config}
-turnaddr=${TURN_SERVER}
-turnusername=${TURN_USERNAME}
-turnpassword=${TURN_PASSWORD}"
-        fi
+        ice_config="icesupport=yes"
     else
         ice_config="# icesupport disabled - LAN only mode"
     fi
