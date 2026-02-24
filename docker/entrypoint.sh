@@ -259,6 +259,28 @@ if [[ -f /etc/asterisk/pjsip.conf ]]; then
     fi
 fi
 
+# ── Ensure transport-tls exists in pjsip.conf (upgrade / migration path) ──
+# If pjsip.conf was preserved from a pre-TLS config or a non-Docker install it
+# will have no [transport-tls] section.  Asterisk starts without TLS silently,
+# and mobile devices cannot register.  Inject the section when it is absent.
+if [[ -f /etc/asterisk/pjsip.conf ]] && ! grep -q "^\[transport-tls\]" /etc/asterisk/pjsip.conf; then
+    log_info "transport-tls missing from pjsip.conf — adding TLS transport (required for mobile registration)..."
+    cat >> /etc/asterisk/pjsip.conf << EOF
+
+[transport-tls]
+type=transport
+protocol=tls
+bind=0.0.0.0:5061
+cert_file=/etc/asterisk/certs/server.crt
+priv_key_file=/etc/asterisk/certs/server.key
+ca_list_file=/etc/ssl/certs/ca-certificates.crt
+method=tlsv1_2
+${nat_settings}
+
+EOF
+    chown asterisk:asterisk /etc/asterisk/pjsip.conf
+fi
+
 # ── rtp.conf (always regenerated - includes TURN credentials) ──
 log_info "Configuring RTP with ICE + STUN + TURN..."
 cat > /etc/asterisk/rtp.conf << EOF
