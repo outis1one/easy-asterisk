@@ -301,6 +301,10 @@ cat > /etc/asterisk/modules.conf << 'EOF'
 autoload=yes
 noload => chan_sip.so
 noload => chan_iax2.so
+; Opus transcoding unavailable on Ubuntu 24.04 (bug #2044135)
+; Opus pass-through still works via res_format_attr_opus.so
+noload => codec_opus.so
+noload => format_ogg_opus.so
 load => res_pjsip.so
 load => res_pjsip_session.so
 load => res_pjsip_logger.so
@@ -313,6 +317,18 @@ load => app_dial.so
 load => app_page.so
 load => pbx_config.so
 EOF
+
+# ── Remove incompatible Digium codec_opus if present on volume ──
+# The Digium binary is ABI-incompatible with Ubuntu 24.04's Asterisk and crashes it
+MODULES_DIR=$(find /usr/lib -type d -name modules -path "*/asterisk/*" 2>/dev/null | head -1)
+if [[ -n "$MODULES_DIR" ]]; then
+    for bad_module in codec_opus.so format_ogg_opus.so; do
+        if [[ -f "$MODULES_DIR/$bad_module" ]] && ! dpkg -S "$MODULES_DIR/$bad_module" >/dev/null 2>&1; then
+            log_warn "Removing incompatible $bad_module (not from Ubuntu package)"
+            rm -f "$MODULES_DIR/$bad_module"
+        fi
+    done
+fi
 
 # ── 9. Fix permissions ───────────────────────────────────────
 chown -R asterisk:asterisk /etc/asterisk /var/lib/asterisk /var/log/asterisk /var/spool/asterisk /var/run/asterisk 2>/dev/null || true
