@@ -82,29 +82,33 @@ services:
     image: coturn/coturn:latest
     container_name: easy-asterisk-coturn
     network_mode: host
-    entrypoint: ["/bin/sh", "-c"]
+    # The coturn image runs as nobody:nogroup by default, which cannot
+    # create /var/run/turnserver.pid. Run as root to avoid this.
+    user: root
+    environment:
+      # Image-native external IP detection (adds --external-ip automatically)
+      - DETECT_EXTERNAL_IP=${DETECT_EXTERNAL_IP:-yes}
     command:
-      - |
-        # Build coturn arguments
-        ARGS="-n --listening-port=3478 --fingerprint --lt-cred-mech"
-        ARGS="$$ARGS --user=${TURN_USERNAME:-easyasterisk}:${TURN_PASSWORD:-changeme}"
-        ARGS="$$ARGS --realm=${DOMAIN_NAME:-localhost}"
-        ARGS="$$ARGS --min-port=${TURN_RELAY_MIN:-49152}"
-        ARGS="$$ARGS --max-port=${TURN_RELAY_MAX:-49252}"
-        # Only add external-ip if PUBLIC_IP is set
-        if [ -n "${PUBLIC_IP:-}" ]; then
-          ARGS="$$ARGS --external-ip=${PUBLIC_IP}"
-        fi
-        ARGS="$$ARGS --no-tls --no-dtls --no-cli"
-        ARGS="$$ARGS --no-multicast-peers --no-loopback-peers"
-        ARGS="$$ARGS --log-file=stdout"
-        exec turnserver $$ARGS
+      - -n
+      - --listening-port=3478
+      - --fingerprint
+      - --lt-cred-mech
+      - --user=${TURN_USERNAME:-easyasterisk}:${TURN_PASSWORD:-changeme}
+      - --realm=${DOMAIN_NAME:-localhost}
+      - --min-port=${TURN_RELAY_MIN:-49152}
+      - --max-port=${TURN_RELAY_MAX:-49252}
+      - --no-tls
+      - --no-dtls
+      - --no-cli
+      - --no-multicast-peers
+      - --log-file=stdout
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "ss -uln | grep -q ':3478'"]
-      interval: 30s
+      test: ["CMD-SHELL", "turnutils_stunclient 127.0.0.1 >/dev/null 2>&1"]
+      interval: 10s
       timeout: 5s
       retries: 3
+      start_period: 10s
 
 volumes:
   asterisk-config:
