@@ -53,7 +53,7 @@ services:
       # ── TURN/STUN Server ──
       # Points to the coturn service (auto-configured)
       - TURN_ENABLED=y
-      - TURN_SERVER=${DOMAIN_NAME:?}:3478
+      - TURN_SERVER=${DOMAIN_NAME:?}:${TURN_PORT:-3478}
       - TURN_USERNAME=${TURN_USERNAME:-easyasterisk}
       - TURN_PASSWORD=${TURN_PASSWORD:-}
 
@@ -90,7 +90,7 @@ services:
       - DETECT_EXTERNAL_IP=${DETECT_EXTERNAL_IP:-yes}
     command:
       - -n
-      - --listening-port=3478
+      - --listening-port=${TURN_PORT:-3478}
       - --fingerprint
       - --lt-cred-mech
       - --user=${TURN_USERNAME:-easyasterisk}:${TURN_PASSWORD:-changeme}
@@ -104,7 +104,7 @@ services:
       - --log-file=stdout
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "turnutils_stunclient 127.0.0.1 >/dev/null 2>&1"]
+      test: ["CMD-SHELL", "turnutils_stunclient -p ${TURN_PORT:-3478} 127.0.0.1 >/dev/null 2>&1"]
       interval: 10s
       timeout: 5s
       retries: 3

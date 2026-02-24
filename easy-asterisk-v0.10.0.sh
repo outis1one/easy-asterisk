@@ -1599,7 +1599,7 @@ show_firewall_guide() {
     echo "   - Protocol: UDP/TCP"
     echo "   - Source: VLAN 10 Net"
     echo "   - Dest:   ${CURRENT_PUBLIC_IP:-Server_IP}"
-    echo "   - Port:   3478"
+    echo "   - Port:   3478 (or your TURN_PORT if changed)"
     echo ""
     echo "STEP 3: Create Rule 2 (The Relay Range - CRITICAL)"
     echo "   - Action: Pass (Allow)"
@@ -1621,7 +1621,7 @@ show_firewall_guide() {
     echo "STEP 2: Create Rule."
     echo "   - Interface: WAN"
     echo "   - Protocol: UDP"
-    echo "   - Dest. Port: 3478 (and 49152-65535)"
+    echo "   - Dest. Port: 3478 (or your TURN_PORT) and 49152-65535"
     echo "   - Redirect IP: ${CURRENT_PUBLIC_IP:-Server_IP}"
     echo ""
     read -p "Press Enter to return..."
@@ -2748,7 +2748,9 @@ configure_local_client() {
              read -p "TURN Host [${server}]: " th
              turn_host="${th:-$server}"
         fi
-        turn_config="turn_server turn:${t_user}:${t_pass}@${turn_host}:3478"
+        read -p "TURN Port [3478]: " t_port
+        t_port="${t_port:-3478}"
+        turn_config="turn_server turn:${t_user}:${t_pass}@${turn_host}:${t_port}"
     fi
     
     # Update config file for TURN
