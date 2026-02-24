@@ -55,7 +55,7 @@ services:
       - TURN_ENABLED=y
       - TURN_SERVER=${DOMAIN_NAME:?}:${TURN_PORT:-3478}
       - TURN_USERNAME=${TURN_USERNAME:-easyasterisk}
-      - TURN_PASSWORD=${TURN_PASSWORD:-}
+      - TURN_PASSWORD=${TURN_PASSWORD:-changeme}
 
       # ── RTP Port Range ──
       - RTP_START=${RTP_START:-10000}
