@@ -207,7 +207,7 @@ bind=0.0.0.0:5061
 ; Server IP: ${local_ip} | Public IP: ${PUBLIC_IP:-unknown}
 cert_file=/etc/asterisk/certs/server.crt
 priv_key_file=/etc/asterisk/certs/server.key
-ca_list_file=/etc/ssl/certs/ca-certificates.crt
+; ca_list_file not set — only needed for verify_client=yes (client cert auth)
 method=tlsv1_2
 ${nat_settings}
 
@@ -273,7 +273,7 @@ protocol=tls
 bind=0.0.0.0:5061
 cert_file=/etc/asterisk/certs/server.crt
 priv_key_file=/etc/asterisk/certs/server.key
-ca_list_file=/etc/ssl/certs/ca-certificates.crt
+; ca_list_file not set — only needed for verify_client=yes (client cert auth)
 method=tlsv1_2
 ${nat_settings}
 

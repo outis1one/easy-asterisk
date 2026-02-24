@@ -22,6 +22,7 @@ RUN echo "exit 101" > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d &&
         asterisk \
         asterisk-core-sounds-en-gsm \
         asterisk-modules \
+        ca-certificates \
         openssl \
         curl \
         wget \
