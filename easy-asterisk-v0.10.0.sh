@@ -3174,6 +3174,7 @@ exten => _X.,1,Hangup()
 EOF
 
     local dev_name="" dev_cat="" dev_auto="" dev_aa_override=""
+    local -A device_extensions=()
     while IFS= read -r line; do
         if [[ "$line" == *"; === Device:"* ]]; then
             dev_aa_override=""
@@ -3198,6 +3199,7 @@ EOF
         if [[ "$line" =~ ^\[([0-9]+)\] ]]; then
             local ext="${BASH_REMATCH[1]}"
             if [[ -n "$dev_name" ]]; then
+                device_extensions[$ext]=1
                 if [[ "$dev_auto" == "yes" ]]; then
                     cat >> "$conf_file" << EOF
 exten => ${ext},1,NoOp(Auto-Answer ${ext})
@@ -3220,11 +3222,15 @@ EOF
         fi
     done < /etc/asterisk/pjsip.conf
 
-    # Add rooms
+    # Add rooms (skip if extension already used by a device)
     if [[ -f "$ROOMS_FILE" ]]; then
         while IFS='|' read -r rext rname rmem rtime rtype; do
             [[ "$rext" =~ ^# ]] && continue
             [[ -z "$rext" ]] && continue
+            if [[ -n "${device_extensions[$rext]:-}" ]]; then
+                [[ "$quiet" != "quiet" ]] && print_warn "Room '$rname' ext $rext conflicts with device — skipping"
+                continue
+            fi
             local dial_list=""
             IFS=',' read -ra EXTS <<< "$rmem"
             for ext in "${EXTS[@]}"; do
@@ -6663,17 +6669,25 @@ import_clients() {
             echo "Importing non-conflicting devices..."
             local temp_import="/tmp/import_filtered_${timestamp}.conf"
             local skip_device=0
+            local pending_header=""
 
             while IFS= read -r line; do
                 if [[ "$line" == "; === Device:"* ]]; then
                     skip_device=0
-                    echo "$line" >> "$temp_import"
+                    pending_header="$line"
                 elif [[ "$line" =~ ^\[([0-9]+)\]$ ]]; then
                     local ext="${BASH_REMATCH[1]}"
                     if grep -q "^\[${ext}\]" /etc/asterisk/pjsip.conf 2>/dev/null; then
                         skip_device=1
-                        echo "  Skipping extension $ext (already exists)"
+                        if [[ -n "$pending_header" ]]; then
+                            echo "  Skipping extension $ext (already exists)"
+                            pending_header=""
+                        fi
                     else
+                        if [[ -n "$pending_header" ]]; then
+                            echo "$pending_header" >> "$temp_import"
+                            pending_header=""
+                        fi
                         echo "$line" >> "$temp_import"
                     fi
                 elif [[ $skip_device -eq 0 ]]; then

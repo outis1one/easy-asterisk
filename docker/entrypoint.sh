@@ -214,6 +214,40 @@ else
     fi
 fi
 
+# ── Sanitize pjsip.conf: remove endpoint-only options from aor sections ──
+if [[ -f /etc/asterisk/pjsip.conf ]]; then
+    # Options that are only valid in [endpoint] sections, not in [aor] sections
+    endpoint_only_opts="direct_media|rtp_symmetric|force_rport|rewrite_contact|rtp_keepalive|rtp_timeout|rtp_timeout_hold|ice_support|context|disallow|allow|auth|aors|callerid|media_encryption|transport"
+    current_type=""
+    needs_fix=false
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^type=(.*) ]]; then
+            current_type="${BASH_REMATCH[1]}"
+        fi
+        if [[ "$current_type" == "aor" ]] && echo "$line" | grep -qE "^(${endpoint_only_opts})="; then
+            needs_fix=true
+            break
+        fi
+    done < /etc/asterisk/pjsip.conf
+
+    if $needs_fix; then
+        log_info "Sanitizing pjsip.conf (removing misplaced options from aor sections)..."
+        awk -v opts="$endpoint_only_opts" '
+        BEGIN { split(opts, arr, "|"); for (i in arr) bad[arr[i]]=1 }
+        /^type=/ { current_type = substr($0, 6) }
+        {
+            if (current_type == "aor") {
+                split($0, kv, "=")
+                if (kv[1] in bad) next
+            }
+            print
+        }
+        ' /etc/asterisk/pjsip.conf > /tmp/pjsip_sanitized.conf
+        mv /tmp/pjsip_sanitized.conf /etc/asterisk/pjsip.conf
+        chown asterisk:asterisk /etc/asterisk/pjsip.conf
+    fi
+fi
+
 # ── rtp.conf (always regenerated - includes TURN credentials) ──
 log_info "Configuring RTP with ICE + STUN + TURN..."
 cat > /etc/asterisk/rtp.conf << EOF
@@ -261,8 +295,8 @@ console => notice,warning,error
 EOF
 fi
 
-if [[ ! -f /etc/asterisk/modules.conf ]]; then
-    cat > /etc/asterisk/modules.conf << 'EOF'
+# ── modules.conf (always regenerated - ensures chan_sip stays disabled) ──
+cat > /etc/asterisk/modules.conf << 'EOF'
 [modules]
 autoload=yes
 noload => chan_sip.so
@@ -280,7 +314,6 @@ load => app_dial.so
 load => app_page.so
 load => pbx_config.so
 EOF
-fi
 
 # ── 9. Fix permissions ───────────────────────────────────────
 chown -R asterisk:asterisk /etc/asterisk /var/lib/asterisk /var/log/asterisk /var/spool/asterisk /var/run/asterisk 2>/dev/null || true
