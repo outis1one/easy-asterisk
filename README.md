@@ -663,6 +663,22 @@ For **any SIP app**:
 - FQDN mode enables ICE (Interactive Connectivity Establishment) which handles network changes better
 - Alternatively, keep your phone on one network type (WiFi or mobile data) during calls
 
+### "No audio when Call Integration is enabled" (Android)
+
+Some Android SIP apps (Sipnetic, Olinuxino, etc.) offer a "Call Integration" feature that routes calls through Android's native dialer (ConnectionService API). When enabled:
+
+- Incoming calls appear in the native phone app
+- The headset media button works for answering
+- **But the caller may get no audio**
+
+**Why this happens:**
+Android's ConnectionService routes audio through the native telephony audio path, which doesn't always relay VoIP RTP audio correctly. This is a client-side Android issue, not an Asterisk problem. It affects both stock Android and LineageOS.
+
+**Fix:**
+- Disable "Call Integration" in your SIP app's settings
+- Use the SIP app's own answer button instead of the headset media button
+- If you need headset button support, check if your SIP app supports media button handling without Call Integration
+
 ### "My IP changed and FQDN stopped working"
 
 See [Dynamic IP Handling](#dynamic-ip-handling) section. You need to set up DDNS.

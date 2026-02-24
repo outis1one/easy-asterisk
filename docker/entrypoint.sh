@@ -54,17 +54,15 @@ else
     log_warn "Could not detect public IP. Set PUBLIC_IP in .env"
 fi
 
-# ── 3. Generate TURN password if not provided ─────────────────
+# ── 3. TURN credentials ─────────────────────────────────────────
+# The password MUST match what coturn was started with. In Docker, both
+# read from the same env-var / .env file, so we use the value as-is.
+# Auto-generating a different password here would create a mismatch
+# (coturn is already running with ITS copy of the env-var).
 TURN_USERNAME="${TURN_USERNAME:-easyasterisk}"
-if [[ -z "${TURN_PASSWORD:-}" ]] || [[ "${TURN_PASSWORD}" == "changeme" ]]; then
-    # Check if we already generated one previously
-    if [[ -f "$CONFIG_FILE" ]] && grep -q "^TURN_PASSWORD=" "$CONFIG_FILE"; then
-        TURN_PASSWORD=$(grep "^TURN_PASSWORD=" "$CONFIG_FILE" | cut -d'"' -f2)
-    fi
-    if [[ -z "${TURN_PASSWORD:-}" ]] || [[ "${TURN_PASSWORD}" == "changeme" ]]; then
-        TURN_PASSWORD=$(gen_password)
-        log_info "Generated TURN password (saved to config)"
-    fi
+TURN_PASSWORD="${TURN_PASSWORD:-changeme}"
+if [[ "${TURN_PASSWORD}" == "changeme" ]]; then
+    log_warn "TURN password is the default 'changeme' — set TURN_PASSWORD in .env for better security"
 fi
 
 # ── 4. Detect local network ──────────────────────────────────
@@ -282,15 +280,21 @@ EOF
 fi
 
 # ── rtp.conf (always regenerated - includes TURN credentials) ──
-log_info "Configuring RTP with ICE + STUN + TURN..."
+# Use 127.0.0.1 for stunaddr/turnaddr because coturn runs on the same host
+# (network_mode: host). Using the FQDN would cause DNS resolution, and if the
+# DNS TTL is 0 Asterisk cancels recurring resolution — breaking ICE entirely
+# and adding a ~27-second timeout delay to every call.
+turn_port="${turn_server##*:}"
+local_turn="127.0.0.1:${turn_port:-3478}"
+log_info "Configuring RTP with ICE + STUN + TURN (local: ${local_turn})..."
 cat > /etc/asterisk/rtp.conf << EOF
 [general]
 rtpstart=${RTP_START:-10000}
 rtpend=${RTP_END:-20000}
 strictrtp=yes
 icesupport=yes
-stunaddr=${turn_server}
-turnaddr=${turn_server}
+stunaddr=${local_turn}
+turnaddr=${local_turn}
 turnusername=${TURN_USERNAME}
 turnpassword=${TURN_PASSWORD}
 EOF
