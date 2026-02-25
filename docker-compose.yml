@@ -85,12 +85,19 @@ services:
     # The coturn image runs as nobody:nogroup by default, which cannot
     # create /var/run/turnserver.pid. Run as root to avoid this.
     user: root
+    # Custom entrypoint bypasses the coturn image's fragile eval-based
+    # entrypoint which causes "Unknown argument:" errors when IP detection
+    # returns empty. Our wrapper handles detection robustly.
+    entrypoint: ["/coturn-entrypoint.sh"]
+    volumes:
+      - ./docker/coturn-entrypoint.sh:/coturn-entrypoint.sh:ro
     environment:
-      # Image-native external IP detection (adds --external-ip automatically)
-      - DETECT_EXTERNAL_IP=${DETECT_EXTERNAL_IP:-yes}
+      # Passed to our entrypoint for --external-ip. Auto-detected if empty.
+      - PUBLIC_IP=${PUBLIC_IP:-}
     command:
       - -n
       - --listening-port=${TURN_PORT:-3478}
+      - --listening-ip=0.0.0.0
       - --fingerprint
       - --lt-cred-mech
       - --user=${TURN_USERNAME:-easyasterisk}:${TURN_PASSWORD:-changeme}
