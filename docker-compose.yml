@@ -111,7 +111,7 @@ services:
       - --log-file=stdout
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "turnutils_stunclient -p ${TURN_PORT:-3478} 127.0.0.1 >/dev/null 2>&1"]
+      test: ["CMD-SHELL", "test -f /var/run/turnserver.pid && kill -0 $(cat /var/run/turnserver.pid)"]
       interval: 10s
       timeout: 5s
       retries: 3
