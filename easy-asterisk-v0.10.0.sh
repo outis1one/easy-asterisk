@@ -944,6 +944,28 @@ EOF
     echo "  Server Settings → Provisioning Manager → Create Baresip Config"
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
+
+    # Show TURN/STUN settings if enabled (for manual SIP app configuration)
+    if [[ "$TURN_ENABLED" == "y" && -n "$TURN_SERVER" ]]; then
+        echo ""
+        echo -e "  ${BOLD}STUN/TURN SETTINGS (for NAT traversal)${NC}"
+        echo "═══════════════════════════════════════════════════════════════"
+        echo ""
+        echo "  Configure these in your SIP app's Network/ICE settings:"
+        echo "  ICE:            Enabled"
+        echo "  STUN server:    ${TURN_SERVER}"
+        echo "  TURN server:    ${TURN_SERVER}"
+        echo "  TURN username:  ${TURN_USERNAME}"
+        echo "  TURN password:  ${TURN_PASSWORD}"
+        echo "  TURN transport: UDP"
+        echo ""
+        echo "  Linphone:  Auto-provisioned via XML (no manual setup needed)"
+        echo "  Sipnetic:  Settings → Network → ICE/STUN/TURN"
+        echo "  Olinuxino: Settings → Network → ICE/STUN/TURN"
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+    fi
+
     echo ""
     echo "  NOTE: These instructions work for most SIP apps (Zoiper,"
     echo "        sipnetic, etc.) - just use the same credentials."
@@ -2015,10 +2037,19 @@ create_linphone_xml() {
 
   <section name="net">
     <entry name="mtu">1300</entry>
+    <!-- ICE + STUN/TURN for NAT traversal -->
+    <entry name="firewall_policy">3</entry>
+    <entry name="stun_server">${TURN_SERVER:-${domain}:3478}</entry>
   </section>
 
 </config>
 EOF
+
+    # Add TURN credentials section if TURN is enabled
+    if [[ "$TURN_ENABLED" == "y" && -n "$TURN_SERVER" && -n "$TURN_USERNAME" && -n "$TURN_PASSWORD" ]]; then
+        # Insert TURN credentials into the net section before </config>
+        sed -i "s|<entry name=\"stun_server\">.*</entry>|<entry name=\"stun_server\">${TURN_SERVER}</entry>\n    <entry name=\"turn_enable\">1</entry>\n    <entry name=\"turn_username\">${TURN_USERNAME}</entry>\n    <entry name=\"turn_password\">${TURN_PASSWORD}</entry>|" "$xml_file"
+    fi
 
         chown asterisk:asterisk "$xml_file"
         chmod 644 "$xml_file"
@@ -4747,20 +4778,33 @@ qualify_frequency=30
     return True, {'extension': extension, 'password': password, 'name': name}
 
 def get_server_info():
-    """Get server configuration info"""
+    """Get server configuration info including TURN/STUN details"""
     info = {
         'domain': '',
         'tls_enabled': False,
-        'server_ip': ''
+        'server_ip': '',
+        'turn_enabled': False,
+        'turn_server': '',
+        'turn_username': '',
+        'turn_password': ''
     }
 
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r') as f:
             for line in f:
+                line = line.strip()
                 if line.startswith('DOMAIN_NAME='):
                     info['domain'] = line.split('=', 1)[1].strip().strip('"')
                 elif line.startswith('ENABLE_TLS='):
                     info['tls_enabled'] = 'y' in line.lower()
+                elif line.startswith('TURN_ENABLED='):
+                    info['turn_enabled'] = 'y' in line.split('=', 1)[1].lower()
+                elif line.startswith('TURN_SERVER='):
+                    info['turn_server'] = line.split('=', 1)[1].strip().strip('"')
+                elif line.startswith('TURN_USERNAME='):
+                    info['turn_username'] = line.split('=', 1)[1].strip().strip('"')
+                elif line.startswith('TURN_PASSWORD='):
+                    info['turn_password'] = line.split('=', 1)[1].strip().strip('"')
 
     try:
         result = subprocess.run(['hostname', '-I'], capture_output=True, text=True)
@@ -5654,11 +5698,25 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
                 if (result.success) {
                     closeModal();
-                    document.getElementById('credentials-display').innerHTML = `
+                    let credHtml = `
                         <p><strong>Extension:</strong> ${result.data.extension}</p>
                         <p><strong>Password:</strong> ${result.data.password}</p>
                         <p><strong>Name:</strong> ${result.data.name}</p>
                     `;
+                    // Fetch server info to show TURN details
+                    try {
+                        const srvRes = await fetch(API_BASE + '/server');
+                        const srv = await srvRes.json();
+                        if (srv.turn_enabled && srv.turn_server) {
+                            credHtml += `<hr style="margin:12px 0;border-color:#e2e8f0">
+                                <p style="font-size:13px;color:#64748b;margin-bottom:6px">STUN/TURN (configure in app Network settings)</p>
+                                <p><strong>STUN/TURN server:</strong> ${srv.turn_server}</p>
+                                <p><strong>TURN username:</strong> ${srv.turn_username}</p>
+                                <p><strong>TURN password:</strong> ${srv.turn_password}</p>
+                            `;
+                        }
+                    } catch(e) {}
+                    document.getElementById('credentials-display').innerHTML = credHtml;
                     document.getElementById('credentials-modal').classList.add('active');
                 } else {
                     showAlert(result.error || 'Failed to add device', 'error');
